@@ -28,6 +28,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 from datetime import timedelta
 
+SEASON = 2025
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dates = [
         datetime.utcnow().strftime("%Y-%m-%d"),
