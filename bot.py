@@ -1,58 +1,75 @@
 import os
 import requests
-from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_KEY = os.getenv("FOOTBALL_API_KEY")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
-LEAGUES = {
-    "England": 39,     # Premier League
-    "Spain": 140,      # La Liga
-    "Italy": 135,      # Serie A
-    "Germany": 78,     # Bundesliga
-    "Russia": 235      # RPL
-}
-
+# ====== API CONFIG ======
+API_URL = "https://v3.football.api-sports.io/fixtures"
 HEADERS = {
-    "x-apisports-key": API_KEY
+    "x-apisports-key": FOOTBALL_API_KEY
 }
+
+SEASON = 2025
+
+# ====== LEAGUES ======
+LEAGUES = {
+    "🇬🇧 Англия — Премьер-лига": 39,
+    "🇪🇸 Испания — Ла Лига": 140,
+    "🇮🇹 Италия — Серия A": 135,
+    "🇩🇪 Германия — Бундеслига": 78,
+    "🇷🇺 Россия — РПЛ": 235
+}
+
+# ====== COMMANDS ======
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР активирован.\n\n"
-        "Команды:\n"
-        "/today — матчи на сегодня\n"
+        "🐺 *ЦЕРБЕР активирован*\n\n"
+        "Я анализирую футбольные матчи топ-лиг Европы.\n\n"
+        "📌 Доступные команды:\n"
+        "/today — ближайшие матчи\n\n"
+        "Скоро:\n"
+        "• прогнозы тоталов\n"
+        "• угловые и карточки\n"
+        "• сигналы с value\n",
+        parse_mode="Markdown"
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_date = datetime.utcnow().strftime("%Y-%m-%d")
-    message = "⚽ Матчи на сегодня:\n\n"
+    message = "⚽ *Ближайшие матчи:*\n\n"
+    found = False
 
     for league_name, league_id in LEAGUES.items():
-        url = "https://v3.football.api-sports.io/fixtures"
         params = {
             "league": league_id,
-            "date": today_date
+            "season": SEASON,
+            "next": 5
         }
 
-        response = requests.get(url, headers=HEADERS, params=params)
+        response = requests.get(API_URL, headers=HEADERS, params=params)
         data = response.json()
 
-        if data.get("response"):
-            message += f"🏆 {league_name}\n"
+        if "response" in data and data["response"]:
+            message += f"*{league_name}*\n"
             for match in data["response"]:
+                date = match["fixture"]["date"][:10]
+                time = match["fixture"]["date"][11:16]
                 home = match["teams"]["home"]["name"]
                 away = match["teams"]["away"]["name"]
-                time = match["fixture"]["date"][11:16]
-                message += f"{time} — {home} vs {away}\n"
+                message += f"`{date} {time}` — {home} vs {away}\n"
+                found = True
             message += "\n"
 
-    if message == "⚽ Матчи на сегодня:\n\n":
-        message += "Сегодня матчей нет."
+    if not found:
+        message += "Матчи не найдены (лимит API или межсезонье)."
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+# ====== MAIN ======
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
