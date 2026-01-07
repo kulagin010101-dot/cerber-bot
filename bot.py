@@ -27,75 +27,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 SEASON = 2025
+
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dates = [
-        datetime.utcnow().strftime("%Y-%m-%d"),
-        (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
-    ]
-
-    message = "⚽ Матчи (сегодня / ближайшие):\n\n"
+    message = "⚽ Ближайшие матчи:\n\n"
     found = False
-
-    for league_name, league_id in LEAGUES.items():
-        league_matches = ""
-
-        for date in dates:
-            url = "https://v3.football.api-sports.io/fixtures"
-            params = {
-                "league": league_id,
-                "date": date
-            }
-
-            response = requests.get(url, headers=HEADERS, params=params)
-            data = response.json()
-
-            if data.get("response"):
-                for match in data["response"]:
-                    home = match["teams"]["home"]["name"]
-                    away = match["teams"]["away"]["name"]
-                    time = match["fixture"]["date"][11:16]
-                    league_matches += f"{time} — {home} vs {away}\n"
-                    found = True
-
-        if league_matches:
-            message += f"🏆 {league_name}\n{league_matches}\n"
-
-    if not found:
-        message += "Нет матчей в выбранных лигах."
-
-    await update.message.reply_text(message)
-
-    message = "⚽ Матчи на сегодня:\n\n"
 
     for league_name, league_id in LEAGUES.items():
         url = "https://v3.football.api-sports.io/fixtures"
         params = {
             "league": league_id,
-            "date": today_date
+            "season": SEASON,
+            "next": 5
         }
 
         response = requests.get(url, headers=HEADERS, params=params)
         data = response.json()
 
-        if data.get("response"):
+        if "response" in data and data["response"]:
             message += f"🏆 {league_name}\n"
             for match in data["response"]:
+                date = match["fixture"]["date"][:10]
+                time = match["fixture"]["date"][11:16]
                 home = match["teams"]["home"]["name"]
                 away = match["teams"]["away"]["name"]
-                time = match["fixture"]["date"][11:16]
-                message += f"{time} — {home} vs {away}\n"
+                message += f"{date} {time} — {home} vs {away}\n"
+                found = True
             message += "\n"
 
-    if message == "⚽ Матчи на сегодня:\n\n":
-        message += "Сегодня матчей нет."
+    if not found:
+        message += "Матчи не найдены (лимит API или межсезонье)."
 
     await update.message.reply_text(message)
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("today", today))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
