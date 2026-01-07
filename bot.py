@@ -20,56 +20,64 @@ LEAGUES = {
     "🇬🇧 Англия — Премьер-лига": 39,
     "🇪🇸 Испания — Ла Лига": 140,
     "🇮🇹 Италия — Серия A": 135,
-    "🇩🇪 Германия — Бундеслига": 78,
-    "🇷🇺 Россия — РПЛ": 235
+    "🇩🇪 Германия — Бундеслига": 78,import requests
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+BOT_TOKEN = "ВАШ_BOT_TOKEN"  # Лучше через ENV переменные
+
+# Ссылки на топ-лиги FlashScore
+LEAGUES = {
+    "Англия — Премьер-лига": "https://www.flashscore.com/football/england/premier-league/",
+    "Испания — Ла Лига": "https://www.flashscore.com/football/spain/laliga/",
+    "Италия — Серия A": "https://www.flashscore.com/football/italy/serie-a/",
+    "Германия — Бундеслига": "https://www.flashscore.com/football/germany/bundesliga/",
+    "Россия — РПЛ": "https://www.flashscore.com/football/russia/premier-league/"
 }
 
-# ====== COMMANDS ======
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 *ЦЕРБЕР активирован*\n\n"
-        "Я анализирую футбольные матчи топ-лиг Европы.\n\n"
-        "📌 Доступные команды:\n"
-        "/today — ближайшие матчи\n\n"
-        "Скоро:\n"
-        "• прогнозы тоталов\n"
-        "• угловые и карточки\n"
-        "• сигналы с value\n",
-        parse_mode="Markdown"
+        "🐺 ЦЕРБЕР активирован!\n\n"
+        "Команды:\n"
+        "/today — ближайшие матчи топ-лиг"
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "⚽ *Ближайшие матчи:*\n\n"
-    found = False
-
-    for league_name, league_id in LEAGUES.items():
-        params = {
-            "league": league_id,
-            "season": SEASON,
-            "next": 5
-        }
-
-        response = requests.get(API_URL, headers=HEADERS, params=params)
-        data = response.json()
-
-        if "response" in data and data["response"]:
-            message += f"*{league_name}*\n"
-            for match in data["response"]:
-                date = match["fixture"]["date"][:10]
-                time = match["fixture"]["date"][11:16]
-                home = match["teams"]["home"]["name"]
-                away = match["teams"]["away"]["name"]
-                message += f"`{date} {time}` — {home} vs {away}\n"
-                found = True
-            message += "\n"
-
-    if not found:
-        message += "Матчи не найдены (лимит API или межсезонье)."
-
+    
+    try:
+        for league_name, url in LEAGUES.items():
+            response = requests.get(url, headers=HEADERS)
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            matches = []
+            for match in soup.select(".event__match")[:10]:  # Берём 10 ближайших
+                home = match.select_one(".event__participant--home")
+                away = match.select_one(".event__participant--away")
+                time = match.select_one(".event__time")
+                
+                if home and away and time:
+                    matches.append({
+                        "home": home.text.strip(),
+                        "away": away.text.strip(),
+                        "time": time.text.strip()
+                    })
+            
+            if matches:
+                message += f"*{league_name}*\n"
+                for m in matches:
+                    message += f"`{m['time']}` — {m['home']} vs {m['away']}\n"
+                message += "\n"
+        
+    except Exception as e:
+        message = f"Ошибка при получении матчей: {e}"
+    
     await update.message.reply_text(message, parse_mode="Markdown")
-
-# ====== MAIN ======
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -79,5 +87,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
