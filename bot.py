@@ -26,8 +26,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — матчи на сегодня\n"
     )
 
+from datetime import timedelta
+
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    today_date = datetime.utcnow().strftime("%Y-%m-%d")
+    dates = [
+        datetime.utcnow().strftime("%Y-%m-%d"),
+        (datetime.utcnow() + timedelta(days=1)).strftime("%Y-%m-%d")
+    ]
+
+    message = "⚽ Матчи (сегодня / ближайшие):\n\n"
+    found = False
+
+    for league_name, league_id in LEAGUES.items():
+        league_matches = ""
+
+        for date in dates:
+            url = "https://v3.football.api-sports.io/fixtures"
+            params = {
+                "league": league_id,
+                "date": date
+            }
+
+            response = requests.get(url, headers=HEADERS, params=params)
+            data = response.json()
+
+            if data.get("response"):
+                for match in data["response"]:
+                    home = match["teams"]["home"]["name"]
+                    away = match["teams"]["away"]["name"]
+                    time = match["fixture"]["date"][11:16]
+                    league_matches += f"{time} — {home} vs {away}\n"
+                    found = True
+
+        if league_matches:
+            message += f"🏆 {league_name}\n{league_matches}\n"
+
+    if not found:
+        message += "Нет матчей в выбранных лигах."
+
+    await update.message.reply_text(message)
+
     message = "⚽ Матчи на сегодня:\n\n"
 
     for league_name, league_id in LEAGUES.items():
