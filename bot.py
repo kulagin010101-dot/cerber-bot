@@ -7,64 +7,67 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
+# ====== API CONFIG ======
 API_URL = "https://v3.football.api-sports.io/fixtures"
-HEADERS = {"x-apisports-key": FOOTBALL_API_KEY}
+HEADERS = {
+    "x-apisports-key": FOOTBALL_API_KEY
+}
 
-# ⚠️ ВАЖНО: сезон 2024 = сезон 2024/25
-SEASON = 2024
+SEASON = 2025
 
-# Лиги, которые нам нужны
-LEAGUE_IDS = {
-    39: "🇬🇧 Англия — Премьер-лига",
-    140: "🇪🇸 Испания — Ла Лига",
-    135: "🇮🇹 Италия — Серия A",
-    78: "🇩🇪 Германия — Бундеслига",
-    235: "🇷🇺 Россия — РПЛ",
+# ====== LEAGUES ======
+LEAGUES = {
+    "🇬🇧 Англия — Премьер-лига": 39,
+    "🇪🇸 Испания — Ла Лига": 140,
+    "🇮🇹 Италия — Серия A": 135,
+    "🇩🇪 Германия — Бундеслига": 78,
+    "🇷🇺 Россия — РПЛ": 235
 }
 
 # ====== COMMANDS ======
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР активирован\n\n"
-        "Команды:\n"
-        "/today — ближайшие матчи\n"
+        "🐺 *ЦЕРБЕР активирован*\n\n"
+        "Я анализирую футбольные матчи топ-лиг Европы.\n\n"
+        "📌 Доступные команды:\n"
+        "/today — ближайшие матчи\n\n"
+        "Скоро:\n"
+        "• прогнозы тоталов\n"
+        "• угловые и карточки\n"
+        "• сигналы с value\n",
+        parse_mode="Markdown"
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = "⚽ Ближайшие матчи:\n\n"
+    message = "⚽ *Ближайшие матчи:*\n\n"
     found = False
 
-    # ⚠️ КЛЮЧЕВОЙ МОМЕНТ — БЕРЁМ БЕЗ ЛИГИ
-    params = {
-        "season": SEASON,
-        "next": 50
-    }
+    for league_name, league_id in LEAGUES.items():
+        params = {
+            "league": league_id,
+            "season": SEASON,
+            "next": 5
+        }
 
-    response = requests.get(API_URL, headers=HEADERS, params=params)
-    data = response.json()
+        response = requests.get(API_URL, headers=HEADERS, params=params)
+        data = response.json()
 
-    if "response" not in data:
-        await update.message.reply_text("Ошибка API-Football.")
-        return
-
-    for match in data["response"]:
-        league_id = match["league"]["id"]
-
-        if league_id in LEAGUE_IDS:
-            league_name = LEAGUE_IDS[league_id]
-            date = match["fixture"]["date"][:10]
-            time = match["fixture"]["date"][11:16]
-            home = match["teams"]["home"]["name"]
-            away = match["teams"]["away"]["name"]
-
-            message += f"{league_name}\n{date} {time} — {home} vs {away}\n\n"
-            found = True
+        if "response" in data and data["response"]:
+            message += f"*{league_name}*\n"
+            for match in data["response"]:
+                date = match["fixture"]["date"][:10]
+                time = match["fixture"]["date"][11:16]
+                home = match["teams"]["home"]["name"]
+                away = match["teams"]["away"]["name"]
+                message += f"`{date} {time}` — {home} vs {away}\n"
+                found = True
+            message += "\n"
 
     if not found:
-        message += "Матчи не найдены (лимит API или пауза в лигах)."
+        message += "Матчи не найдены (лимит API или межсезонье)."
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 # ====== MAIN ======
 
