@@ -1,26 +1,4 @@
-import os
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-# ====== ENV ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
-
-# ====== API CONFIG ======
-API_URL = "https://v3.football.api-sports.io/fixtures"
-HEADERS = {
-    "x-apisports-key": FOOTBALL_API_KEY
-}
-
-SEASON = 2025
-
-# ====== LEAGUES ======
-LEAGUES = {
-    "🇬🇧 Англия — Премьер-лига": 39,
-    "🇪🇸 Испания — Ла Лига": 140,
-    "🇮🇹 Италия — Серия A": 135,
-    "🇩🇪 Германия — Бундеслига": 78,import requests
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -87,4 +65,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
