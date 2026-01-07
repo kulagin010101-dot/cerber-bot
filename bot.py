@@ -7,7 +7,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не задан! Проверь переменные окружения Railway.")
 
-# Топ-лиги и их internal IDs для FlashScore JSON
+# Топ-лиги и условные internal IDs (для примера, можно заменить на реальные)
 LEAGUES = {
     "Англия — Премьер-лига": "1",
     "Испания — Ла Лига": "2",
@@ -16,7 +16,7 @@ LEAGUES = {
     "Россия — РПЛ": "5"
 }
 
-# Базовый endpoint JSON (FlashScore)
+# Временный JSON FlashScore для примера (реальный endpoint нужно заменить)
 FLASH_URL = "https://d.flashscore.com/x/feed/0_football_en_uk.js"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -27,16 +27,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = "⚽ *Ближайшие матчи:*\n\n"
+    message = "⚽️ Ближайшие матчи:\n\n"
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(FLASH_URL, headers=headers)
         resp.raise_for_status()
         text = resp.text
 
-        # FlashScore JSON приходит как JS-переменная, убираем лишнее
+        # FlashScore JSON приходит как JS-переменная
         start_idx = text.find("window['fsFeed'] = ") + len("window['fsFeed'] = ")
         end_idx = text.rfind(";")
         json_text = text[start_idx:end_idx]
@@ -49,20 +47,21 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             matches = []
             for ev in data.get("events", []):
                 if ev.get("leagueId") == league_id:
-                    home = ev.get("homeTeam", {}).get("name")
-                    away = ev.get("awayTeam", {}).get("name")
-                    time = ev.get("startTime")
+                    home = ev.get("homeTeam", {}).get("name", "")
+                    away = ev.get("awayTeam", {}).get("name", "")
+                    time = ev.get("startTime", "")
                     if home and away and time:
                         matches.append({"home": home, "away": away, "time": time})
 
             if matches:
-                message += f"*{league_name}*\n"
-                for m in matches[:10]:  # по 10 матчей
-                    message += f"`{m['time']}` — {m['home']} vs {m['away']}\n"
+                message += f"{league_name}:\n"
+                for m in matches[:10]:
+                    # без Markdown, спецсимволы не ломают сообщение
+                    message += f"{m['time']} — {m['home']} vs {m['away']}\n"
                 message += "\n"
                 found = True
             else:
-                message += f"*{league_name}*: матчи не найдены\n\n"
+                message += f"{league_name}: матчи не найдены\n\n"
 
         if not found:
             message += "Матчи не найдены."
@@ -70,7 +69,8 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         message = f"❌ Ошибка при получении матчей: {e}"
 
-    await update.message.reply_text(message, parse_mode="Markdown")
+    # просто plain text
+    await update.message.reply_text(message)
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -80,4 +80,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
