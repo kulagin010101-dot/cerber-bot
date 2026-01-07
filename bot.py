@@ -3,11 +3,9 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPORTMONKS_API_KEY = os.getenv("SPORTMONKS_API_KEY")
 
-# Лиги, которые нам нужны
 LEAGUES = {
     39: "🇬🇧 Англия — Премьер-лига",
     140: "🇪🇸 Испания — Ла Лига",
@@ -15,8 +13,6 @@ LEAGUES = {
     78: "🇩🇪 Германия — Бундеслига",
     235: "🇷🇺 Россия — РПЛ",
 }
-
-# ====== COMMANDS ======
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -30,14 +26,15 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found = False
 
     try:
-        # Формируем URL с GET-параметрами
+        url = "https://soccer.sportmonks.com/api/v3/fixtures"
         league_ids = ",".join(str(x) for x in LEAGUES.keys())
-        url = f"https://soccer.sportmonks.com/api/v2.0/fixtures"
         params = {
             "api_token": SPORTMONKS_API_KEY,
-            "filter[league_id]": league_ids,
+            "include": "localTeam,visitorTeam,league",
             "sort": "starting_at",
-            "per_page": 10
+            "filter[league_id]": league_ids,
+            "per_page": 10,
+            "page": 1
         }
 
         response = requests.get(url, params=params)
@@ -49,11 +46,11 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         for match in data["data"]:
-            league_id = match["league_id"]
+            league_id = match["league"]["data"]["id"]
             if league_id in LEAGUES:
                 league_name = LEAGUES[league_id]
-                date = match["time"]["starting_at"]["date"]
-                time = match["time"]["starting_at"]["time"]
+                date = match["starting_at"]["date"]
+                time = match["starting_at"]["time"]
                 home = match["localTeam"]["data"]["name"]
                 away = match["visitorTeam"]["data"]["name"]
                 message += f"*{league_name}*\n`{date} {time}` — {home} vs {away}\n\n"
@@ -66,8 +63,6 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = f"Ошибка при получении матчей: {e}"
 
     await update.message.reply_text(message, parse_mode="Markdown")
-
-# ====== MAIN ======
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
