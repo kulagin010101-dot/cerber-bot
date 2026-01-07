@@ -26,8 +26,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — матчи на сегодня\n"
     )
 
-from datetime import timedelta
-
 SEASON = 2025
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dates = [
