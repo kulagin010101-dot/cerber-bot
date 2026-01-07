@@ -26,36 +26,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/today — матчи на сегодня\n"
     )
 
-SEASON = 2025
-
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = "⚽ Ближайшие матчи:\n\n"
-    found = False
+    today_date = datetime.utcnow().strftime("%Y-%m-%d")
+    message = "⚽ Матчи на сегодня:\n\n"
 
     for league_name, league_id in LEAGUES.items():
         url = "https://v3.football.api-sports.io/fixtures"
         params = {
             "league": league_id,
-            "season": SEASON,
-            "next": 5
+            "date": today_date
         }
 
         response = requests.get(url, headers=HEADERS, params=params)
         data = response.json()
 
-        if "response" in data and data["response"]:
+        if data.get("response"):
             message += f"🏆 {league_name}\n"
             for match in data["response"]:
-                date = match["fixture"]["date"][:10]
-                time = match["fixture"]["date"][11:16]
                 home = match["teams"]["home"]["name"]
                 away = match["teams"]["away"]["name"]
-                message += f"{date} {time} — {home} vs {away}\n"
-                found = True
+                time = match["fixture"]["date"][11:16]
+                message += f"{time} — {home} vs {away}\n"
             message += "\n"
 
-    if not found:
-        message += "Матчи не найдены (лимит API или межсезонье)."
+    if message == "⚽ Матчи на сегодня:\n\n":
+        message += "Сегодня матчей нет."
 
     await update.message.reply_text(message)
+
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("today", today))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
 
