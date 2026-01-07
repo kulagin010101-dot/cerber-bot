@@ -7,10 +7,6 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPORTMONKS_API_KEY = os.getenv("SPORTMONKS_API_KEY")
 
-# ====== API CONFIG ======
-API_URL = "https://soccer.sportmonks.com/api/v2.0/fixtures/next/50"
-HEADERS = {"Authorization": f"Bearer {SPORTMONKS_API_KEY}"}
-
 # Лиги, которые нам нужны
 LEAGUES = {
     39: "🇬🇧 Англия — Премьер-лига",
@@ -34,11 +30,22 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found = False
 
     try:
-        response = requests.get(API_URL, headers=HEADERS)
+        # Формируем URL с GET-параметрами
+        league_ids = ",".join(str(x) for x in LEAGUES.keys())
+        url = f"https://soccer.sportmonks.com/api/v2.0/fixtures"
+        params = {
+            "api_token": SPORTMONKS_API_KEY,
+            "filter[league_id]": league_ids,
+            "sort": "starting_at",
+            "per_page": 10
+        }
+
+        response = requests.get(url, params=params)
+        response.raise_for_status()
         data = response.json()
 
-        if "data" not in data:
-            await update.message.reply_text("Ошибка API SportMonks")
+        if "data" not in data or not data["data"]:
+            await update.message.reply_text("Матчи не найдены или лимит Free API исчерпан.")
             return
 
         for match in data["data"]:
