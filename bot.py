@@ -9,8 +9,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")  # OddsPapi
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeatherMap
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 MIN_PROBABILITY = 0.75
 MIN_VALUE = 0.05
@@ -27,11 +27,9 @@ LEAGUES = {
 def calculate_value(probability, odds):
     return probability * odds - 1
 
-# многомодельная вероятность
-def compute_probability(stat_prob, h2h_prob, motivation_prob, weather_factor):
-    # весовые коэффициенты: статистика 50%, H2H 20%, мотивация 20%, погода 10%
+def compute_probability(stat_prob, h2h_prob, motivation_prob, weather_factor, injury_factor):
     prob = stat_prob*0.5 + h2h_prob*0.2 + motivation_prob*0.2
-    prob *= weather_factor
+    prob *= weather_factor * injury_factor
     return prob
 
 def predict_goals(avg_goals):
@@ -49,45 +47,51 @@ def predict_cards():
 
 # ================= СТАТИСТИКА =================
 def get_team_stats(team_name, last_n=10):
-    search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
-    resp = requests.get(search_url, params={"t": team_name}, timeout=10).json()
-    if not resp.get("teams"):
+    try:
+        search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
+        resp = requests.get(search_url, params={"t": team_name}, timeout=10).json()
+        if not resp.get("teams"):
+            return {"scored_avg": 1.5, "conceded_avg": 1.5}
+        team_id = resp["teams"][0]["idTeam"]
+        events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
+        events = requests.get(events_url, timeout=10).json().get("results", [])
+        scored = 0
+        conceded = 0
+        n = min(len(events), last_n)
+        for e in events[:n]:
+            home_team = e.get("strHomeTeam")
+            away_team = e.get("strAwayTeam")
+            home_score = int(e.get("intHomeScore") or 0)
+            away_score = int(e.get("intAwayScore") or 0)
+            if team_name == home_team:
+                scored += home_score
+                conceded += away_score
+            else:
+                scored += away_score
+                conceded += home_score
+        return {"scored_avg": scored/n, "conceded_avg": conceded/n}
+    except:
         return {"scored_avg": 1.5, "conceded_avg": 1.5}
-    team_id = resp["teams"][0]["idTeam"]
-    events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
-    events = requests.get(events_url, timeout=10).json().get("results", [])
-    scored = 0
-    conceded = 0
-    n = min(len(events), last_n)
-    for e in events[:n]:
-        home_team = e.get("strHomeTeam")
-        away_team = e.get("strAwayTeam")
-        home_score = int(e.get("intHomeScore") or 0)
-        away_score = int(e.get("intAwayScore") or 0)
-        if team_name == home_team:
-            scored += home_score
-            conceded += away_score
-        else:
-            scored += away_score
-            conceded += home_score
-    return {"scored_avg": scored/n, "conceded_avg": conceded/n}
 
 # ================= H2H =================
 def get_h2h_probability(home, away, last_n=5):
-    url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsh2h.php"
-    params = {"h": home, "a": away}
-    events = requests.get(url, params=params, timeout=10).json().get("results", [])
-    if not events:
+    try:
+        url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsh2h.php"
+        params = {"h": home, "a": away}
+        events = requests.get(url, params=params, timeout=10).json().get("results", [])
+        if not events:
+            return 0.5
+        home_wins = sum(1 for e in events[:last_n] if (e["strHomeTeam"]==home and int(e.get("intHomeScore") or 0) > int(e.get("intAwayScore") or 0)) or 
+                                                  (e["strAwayTeam"]==home and int(e.get("intAwayScore") or 0) > int(e.get("intHomeScore") or 0)))
+        return home_wins/last_n
+    except:
         return 0.5
-    home_wins = sum(1 for e in events[:last_n] if (e["strHomeTeam"]==home and int(e.get("intHomeScore") or 0) > int(e.get("intAwayScore") or 0)) or 
-                                                (e["strAwayTeam"]==home and int(e.get("intAwayScore") or 0) > int(e.get("intHomeScore") or 0)))
-    return home_wins/last_n
 
 # ================= МОТИВАЦИЯ =================
 def get_team_motivation(team_name, league_id):
-    table_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookuptable.php"
-    params = {"l": league_id, "s": "2025-2026"}
     try:
+        table_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookuptable.php"
+        params = {"l": league_id, "s": "2025-2026"}
         table = requests.get(table_url, params=params, timeout=10).json().get("table", [])
         for team in table:
             if team_name.lower() == team.get("name").lower():
@@ -102,6 +106,28 @@ def get_team_motivation(team_name, league_id):
     except:
         return 1.0
     return 1.0
+
+# ================= ТРАВМЫ =================
+def get_injuries_factor(team_name):
+    try:
+        search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
+        team_data = requests.get(search_url, params={"t": team_name}, timeout=10).json()
+        if not team_data.get("teams"):
+            return 1.0
+        team_id = team_data["teams"][0]["idTeam"]
+        roster_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookup_all_players.php?id={team_id}"
+        roster = requests.get(roster_url, timeout=10).json().get("player", [])
+        factor = 1.0
+        key_players = roster[:5]
+        for player in key_players:
+            status = (player.get("strStatus") or "").lower()
+            if "injured" in status:
+                factor *= 0.85
+            elif "suspended" in status:
+                factor *= 0.80
+        return factor
+    except:
+        return 1.0
 
 # ================= ПОГОДА =================
 def get_weather_factor(city_name):
@@ -142,38 +168,42 @@ def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
     url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsday.php"
     params = {"d": today, "s": "Soccer"}
-    response = requests.get(url, params=params, timeout=10)
-    if response.text.strip() == "":
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.text.strip() == "":
+            return []
+        data = response.json()
+        events = data.get("events", [])
+        matches = []
+        for event in events:
+            league_name = event.get("strLeague")
+            if league_name in LEAGUES:
+                home = event.get("strHomeTeam")
+                away = event.get("strAwayTeam")
+                league_id = LEAGUES[league_name]
+
+                home_stats = get_team_stats(home)
+                away_stats = get_team_stats(away)
+                h2h_prob = get_h2h_probability(home, away)
+                home_mot = get_team_motivation(home, league_id)
+                away_mot = get_team_motivation(away, league_id)
+                avg_goals = ((home_stats["scored_avg"] + away_stats["conceded_avg"])/2) * home_mot * away_mot
+                odds = get_real_odds(home, away)
+                weather_factor = get_weather_factor(event.get("strVenue","London"))
+                injury_factor = (get_injuries_factor(home) + get_injuries_factor(away))/2
+                matches.append({
+                    "home": home,
+                    "away": away,
+                    "avg_goals": avg_goals,
+                    "odds": odds,
+                    "h2h_prob": h2h_prob,
+                    "motivation_prob": (home_mot + away_mot)/2,
+                    "weather_factor": weather_factor,
+                    "injury_factor": injury_factor
+                })
+        return matches
+    except:
         return []
-    data = response.json()
-    events = data.get("events", [])
-    matches = []
-    for event in events:
-        league_name = event.get("strLeague")
-        if league_name in LEAGUES:
-            home = event.get("strHomeTeam")
-            away = event.get("strAwayTeam")
-            league_id = LEAGUES[league_name]
-
-            home_stats = get_team_stats(home)
-            away_stats = get_team_stats(away)
-            h2h_prob = get_h2h_probability(home, away)
-            home_mot = get_team_motivation(home, league_id)
-            away_mot = get_team_motivation(away, league_id)
-            weather_factor = get_weather_factor(event.get("strVenue","London"))
-            avg_goals = ((home_stats["scored_avg"] + away_stats["conceded_avg"])/2) * home_mot * away_mot
-            odds = get_real_odds(home, away)
-
-            matches.append({
-                "home": home,
-                "away": away,
-                "avg_goals": avg_goals,
-                "odds": odds,
-                "h2h_prob": h2h_prob,
-                "weather_factor": weather_factor,
-                "motivation_prob": (home_mot + away_mot)/2
-            })
-    return matches
 
 # ================= ОТПРАВКА СИГНАЛОВ =================
 async def send_signals(app):
@@ -181,13 +211,18 @@ async def send_signals(app):
     if not matches:
         await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
         return
-
     message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
     found = False
     for match in matches:
         for pred in [predict_goals(match["avg_goals"]), predict_corners(), predict_cards()]:
             if pred:
-                probability = compute_probability(pred["probability"], match["h2h_prob"], match["motivation_prob"], match["weather_factor"])
+                probability = compute_probability(
+                    pred["probability"],
+                    match["h2h_prob"],
+                    match["motivation_prob"],
+                    match["weather_factor"],
+                    match["injury_factor"]
+                )
                 value = calculate_value(probability, match["odds"])
                 if probability >= MIN_PROBABILITY and value > 0:
                     found = True
@@ -200,7 +235,6 @@ async def send_signals(app):
                     )
     if not found:
         message += "Сегодня нет value-сигналов от 75%."
-
     await app.bot.send_message(chat_id=CHAT_ID, text=message)
 
 # ================= ДНЕВНАЯ ЗАДАЧА =================
