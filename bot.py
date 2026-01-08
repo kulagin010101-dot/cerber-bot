@@ -29,6 +29,10 @@ def predict_goals(avg_goals):
         probability = 0.78
         market = "ТБ 2.5"
         odds = 1.85
+    elif avg_goals <= 2.0:
+        probability = 0.76
+        market = "ТМ 2.5"
+        odds = 1.90
     else:
         return None
 
@@ -72,42 +76,85 @@ def predict_cards():
         }
     return None
 
+# ================= СТАТИСТИКА КОМАНД =================
+def get_team_stats(team_name):
+    """
+    Возвращает словарь:
+    {
+        'scored_avg': средние голы команды за последние 5 матчей,
+        'conceded_avg': средние голы против команды
+    }
+    """
+    # Получаем команду
+    search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
+    search_resp = requests.get(search_url, params={"t": team_name}, timeout=10)
+    search_data = search_resp.json()
+    if not search_data or not search_data.get("teams"):
+        return {"scored_avg": 1.5, "conceded_avg": 1.5}
+
+    team_id = search_data["teams"][0]["idTeam"]
+
+    # Берём последние 5 матчей
+    events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
+    events_resp = requests.get(events_url, timeout=10)
+    events_data = events_resp.json()
+    events = events_data.get("results", [])
+    if not events:
+        return {"scored_avg": 1.5, "conceded_avg": 1.5}
+
+    scored = 0
+    conceded = 0
+    n = min(len(events), 5)
+
+    for e in events[:5]:
+        # Определяем домашнюю/гостевую роль
+        home_team = e.get("strHomeTeam")
+        away_team = e.get("strAwayTeam")
+        home_score = int(e.get("intHomeScore") or 0)
+        away_score = int(e.get("intAwayScore") or 0)
+
+        if team_name == home_team:
+            scored += home_score
+            conceded += away_score
+        else:
+            scored += away_score
+            conceded += home_score
+
+    return {"scored_avg": scored / n, "conceded_avg": conceded / n}
 
 # ================= МАТЧИ =================
 def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-
     url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsday.php"
-    params = {
-        "d": today,
-        "s": "Soccer"
-    }
+    params = {"d": today, "s": "Soccer"}
 
     response = requests.get(url, params=params, timeout=10)
-
-    # ❗ защита от пустого ответа
     if response.text.strip() == "":
         return []
 
     data = response.json()
-
-    matches = []
     events = data.get("events")
-
     if not events:
         return []
 
+    matches = []
     for event in events:
         league = event.get("strLeague")
         if league in TOP_LEAGUES:
+            home = event.get("strHomeTeam")
+            away = event.get("strAwayTeam")
+
+            # рассчитываем реальные avg_goals на основе статистики команд
+            home_stats = get_team_stats(home)
+            away_stats = get_team_stats(away)
+            avg_goals = (home_stats["scored_avg"] + away_stats["conceded_avg"]) / 2
+
             matches.append({
-                "home": event.get("strHomeTeam"),
-                "away": event.get("strAwayTeam"),
-                "avg_goals": 2.8  # временно
+                "home": home,
+                "away": away,
+                "avg_goals": avg_goals
             })
-
     return matches
-
 
 # ================= TELEGRAM =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -135,11 +182,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found = False
 
     for match in matches:
-        for sig in [
-            predict_goals(match["avg_goals"]),
-            predict_corners(),
-            predict_cards()
-        ]:
+        for sig in [predict_goals(match["avg_goals"]), predict_corners(), predict_cards()]:
             if sig:
                 found = True
                 message += (
@@ -155,13 +198,12 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(message)
 
-
+# ================= ЗАПУСК БОТА =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
