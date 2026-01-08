@@ -1,293 +1,303 @@
 import os
+import json
 import requests
-from datetime import datetime, time, timedelta
-import asyncio
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ================= НАСТРОЙКИ =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # Обязательно число!
-THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+# ==============================
+# НАСТРОЙКИ
+# ==============================
 
-MIN_PROBABILITY = 0.75  # порог сильных сигналов
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeather ключ
+MIN_PROBABILITY = 0.75
+MIN_REF_YELLOW = 4.5
+REF_FILE = "referees.json"
+
 LEAGUES = {
-    "English Premier League": 4328,
-    "Spanish La Liga": 4335,
-    "Italian Serie A": 4332,
-    "German Bundesliga": 4331,
-    "Russian Premier League": 4398
+    "EPL": 39,
+    "La Liga": 140,
+    "Serie A": 135,
+    "Bundesliga": 78,
+    "RPL": 235,
 }
 
-# ================= ФУНКЦИИ =================
-def calculate_value(probability, odds):
-    return probability * odds - 1
+# ==============================
+# СУДЬИ
+# ==============================
 
-def compute_probability(stat_prob, h2h_prob, motivation_prob, weather_factor, injury_factor):
-    prob = stat_prob*0.5 + h2h_prob*0.2 + motivation_prob*0.2
-    prob *= weather_factor * injury_factor
-    return prob
+def load_referees():
+    if not os.path.exists(REF_FILE):
+        return {}
+    with open(REF_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def predict_goals(avg_goals):
-    if avg_goals >= 3.0:
-        return {"market": "ТБ 2.5", "probability": 0.78}
-    elif avg_goals <= 2.0:
-        return {"market": "ТМ 2.5", "probability": 0.76}
-    return None
+def save_referees(data):
+    with open(REF_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def predict_corners():
-    return {"market": "ТБ 8.5 угловых", "probability": 0.77}
+def update_referee(refs, name, yellow, red, penalty):
+    if not name or name == "Unknown":
+        return
+    r = refs.setdefault(name, {"matches": 0, "yellow": 0, "red": 0, "penalties": 0})
+    r["matches"] += 1
+    r["yellow"] += yellow
+    r["red"] += red
+    r["penalties"] += penalty
 
-def predict_cards():
-    return {"market": "ТБ 4.5 ЖК", "probability": 0.79}
+def referee_avg(refs, name):
+    r = refs.get(name)
+    if not r or r["matches"] < 5:
+        return None
+    return {
+        "yellow_avg": r["yellow"] / r["matches"],
+        "red_avg": r["red"] / r["matches"],
+        "penalty_avg": r["penalties"] / r["matches"]
+    }
 
-# ================= СТАТИСТИКА =================
-def get_team_stats(team_name, last_n=10):
-    try:
-        search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
-        resp = requests.get(search_url, params={"t": team_name}, timeout=10).json()
-        if not resp.get("teams"):
-            return {"scored_avg": 1.5, "conceded_avg": 1.5}
-        team_id = resp["teams"][0]["idTeam"]
-        events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
-        events = requests.get(events_url, timeout=10).json().get("results", [])
-        scored = 0
-        conceded = 0
-        n = min(len(events), last_n)
-        for e in events[:n]:
-            home_team = e.get("strHomeTeam")
-            away_team = e.get("strAwayTeam")
-            home_score = int(e.get("intHomeScore") or 0)
-            away_score = int(e.get("intAwayScore") or 0)
-            if team_name == home_team:
-                scored += home_score
-                conceded += away_score
-            else:
-                scored += away_score
-                conceded += home_score
-        return {"scored_avg": scored/n, "conceded_avg": conceded/n}
-    except Exception as ex:
-        print("get_team_stats error:", ex)
-        return {"scored_avg": 1.5, "conceded_avg": 1.5}
-
-# ================= H2H =================
-def get_h2h_probability(home, away, last_n=5):
-    try:
-        url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsh2h.php"
-        params = {"h": home, "a": away}
-        events = requests.get(url, params=params, timeout=10).json().get("results", [])
-        if not events:
-            return 0.5
-        home_wins = sum(1 for e in events[:last_n] if (e["strHomeTeam"]==home and int(e.get("intHomeScore") or 0) > int(e.get("intAwayScore") or 0)) or 
-                                                  (e["strAwayTeam"]==home and int(e.get("intAwayScore") or 0) > int(e.get("intHomeScore") or 0)))
-        return home_wins/last_n
-    except Exception as ex:
-        print("get_h2h_probability error:", ex)
-        return 0.5
-
-# ================= МОТИВАЦИЯ =================
-def get_team_motivation(team_name, league_id):
-    try:
-        table_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookuptable.php"
-        params = {"l": league_id, "s": "2025-2026"}
-        table = requests.get(table_url, params=params, timeout=10).json().get("table", [])
-        for team in table:
-            if team_name.lower() == team.get("name").lower():
-                pos = int(team.get("intRank") or 999)
-                total = len(table)
-                if pos <= 3 or pos >= total-2:
-                    return 1.12
-                elif pos in [4,5,6]:
-                    return 1.08
-                else:
-                    return 1.0
-    except Exception as ex:
-        print("get_team_motivation error:", ex)
+def referee_factor(ref_data, market):
+    if not ref_data:
         return 1.0
+    if market == "cards":
+        if ref_data["yellow_avg"] >= 5.3:
+            return 1.18
+        elif ref_data["yellow_avg"] <= 4.0:
+            return 0.9
+    if market == "goals" and ref_data["penalty_avg"] >= 0.35:
+        return 1.12
     return 1.0
 
-# ================= ТРАВМЫ =================
-def get_injuries_factor(team_name):
-    try:
-        search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
-        team_data = requests.get(search_url, params={"t": team_name}, timeout=10).json()
-        if not team_data.get("teams"):
-            return 1.0
-        team_id = team_data["teams"][0]["idTeam"]
-        roster_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookup_all_players.php?id={team_id}"
-        roster = requests.get(roster_url, timeout=10).json().get("player", [])
-        factor = 1.0
-        key_players = roster[:5]
-        for player in key_players:
-            status = (player.get("strStatus") or "").lower()
-            if "injured" in status:
-                factor *= 0.85
-            elif "suspended" in status:
-                factor *= 0.80
-        return factor
-    except Exception as ex:
-        print("get_injuries_factor error:", ex)
-        return 1.0
+def referee_label(ref_data):
+    if not ref_data:
+        return "⚪ нет данных"
+    avg = ref_data["yellow_avg"]
+    if avg >= 5.3:
+        return f"🔥 строгий ({avg:.1f})"
+    elif avg >= 4.3:
+        return f"🟡 средний ({avg:.1f})"
+    else:
+        return f"🟢 мягкий ({avg:.1f})"
 
-# ================= ПОГОДА =================
-def get_weather_factor(city_name):
+# ==============================
+# ПОГОДА
+# ==============================
+
+def get_weather_factor(stadium_city):
     if not WEATHER_API_KEY:
         return 1.0
     try:
-        url = f"http://api.openweathermap.org/data/2.5/weather"
-        params = {"q": city_name, "appid": WEATHER_API_KEY, "units":"metric"}
-        resp = requests.get(url, params=params, timeout=10).json()
-        weather = resp.get("weather", [{}])[0].get("main","Clear").lower()
-        if weather in ["rain","snow","thunderstorm"]:
-            return 0.9
-        elif weather in ["clear","clouds"]:
-            return 1.0
-        return 1.0
-    except Exception as ex:
-        print("get_weather_factor error:", ex)
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={stadium_city}&appid={WEATHER_API_KEY}&units=metric"
+        r = requests.get(url, timeout=10).json()
+        temp = r["main"]["temp"]
+        rain = r.get("rain", {}).get("1h", 0)
+        snow = r.get("snow", {}).get("1h", 0)
+        factor = 1.0
+        if temp < 5:
+            factor *= 0.95
+        elif temp > 30:
+            factor *= 0.9
+        if rain > 0:
+            factor *= 0.92
+        if snow > 0:
+            factor *= 0.9
+        return factor
+    except:
         return 1.0
 
-# ================= OddsPapi =================
-def get_real_odds(home, away):
-    if not ODDS_API_KEY:
-        return 1.85
+# ==============================
+# МОТИВАЦИЯ
+# ==============================
+
+def get_motivation(home_rank, away_rank):
+    diff = abs(home_rank - away_rank)
+    if diff <= 2:
+        return 1.10
+    elif diff <= 5:
+        return 1.05
+    else:
+        return 1.0
+
+# ==============================
+# ФОРМА И ТРАВМЫ
+# ==============================
+
+def get_form_factor(team_id):
+    """Оценивает форму команды (победы/ничьи/поражения последние 5 матчей)"""
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
+    url = f"https://v3.football.api-sports.io/teams/form?team={team_id}&last=5"
     try:
-        url = "https://api.oddspapi.io/v4/odds"
-        params = {"sport":"soccer","region":"eu","mkt":"totals","apiKey":ODDS_API_KEY}
-        resp = requests.get(url, params=params, timeout=10).json()
-        for event in resp.get("data", []):
-            if home.lower() in event.get("home_team","").lower() and away.lower() in event.get("away_team","").lower():
-                odds_list = event.get("odds", [])
-                if odds_list:
-                    return float(odds_list[0].get("odd",1.85))
-    except Exception as ex:
-        print("get_real_odds error:", ex)
-    return 1.85
+        r = requests.get(url, headers=headers, timeout=10).json()
+        form = r.get("response", [])
+        wins = sum(1 for x in form if x["win"] == "Win")
+        factor = 1.0 + (wins * 0.02)  # каждая победа +2% к вероятности
+        return factor
+    except:
+        return 1.0
 
-# ================= МАТЧИ =================
+def get_injuries_factor(team_id):
+    """Уменьшает вероятность из-за травм"""
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
+    url = f"https://v3.football.api-sports.io/players/injuries?team={team_id}"
+    try:
+        r = requests.get(url, headers=headers, timeout=10).json()
+        injuries = len(r.get("response", []))
+        factor = 1.0 - min(0.1, injuries*0.02)  # максимум -10%
+        return factor
+    except:
+        return 1.0
+
+# ==============================
+# СЫГРАННЫЕ МАТЧИ ДЛЯ СУДЕЙ
+# ==============================
+
+def get_finished_matches_api():
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
+    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    finished = []
+
+    for league_id in LEAGUES.values():
+        url = f"https://v3.football.api-sports.io/fixtures?date={yesterday}&league={league_id}&season=2025"
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        if not data or not data.get("response"):
+            continue
+        for e in data["response"]:
+            fixture = e["fixture"]
+            cards = e.get("cards", [])
+            penalties = e.get("penalty", [])
+            yellow = sum(1 for c in cards if c["type"] == "Yellow")
+            red = sum(1 for c in cards if c["type"] == "Red")
+            penalty_count = len(penalties)
+            finished.append({
+                "referee": fixture.get("referee") or "Unknown",
+                "yellow": yellow,
+                "red": red,
+                "penalty": penalty_count
+            })
+    return finished
+
+async def update_referees_api_job(context: ContextTypes.DEFAULT_TYPE):
+    refs = load_referees()
+    finished_matches = get_finished_matches_api()
+    for m in finished_matches:
+        update_referee(refs, m["referee"], m["yellow"], m["red"], m["penalty"])
+    save_referees(refs)
+    print(f"REF UPDATE API: {len(finished_matches)} matches processed")
+
+# ==============================
+# СЫГРАННЫЕ МАТЧИ СИГНАЛЫ
+# ==============================
+
 def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsday.php"
-    params = {"d": today, "s": "Soccer"}
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.text.strip() == "":
-            return []
-        data = response.json()
-        events = data.get("events", [])
-        matches = []
-        for event in events:
-            league_name = event.get("strLeague")
-            if league_name in LEAGUES:
-                home = event.get("strHomeTeam")
-                away = event.get("strAwayTeam")
-                league_id = LEAGUES[league_name]
+    matches = []
+    headers = {"x-apisports-key": FOOTBALL_API_KEY}
 
-                home_stats = get_team_stats(home)
-                away_stats = get_team_stats(away)
-                h2h_prob = get_h2h_probability(home, away)
-                home_mot = get_team_motivation(home, league_id)
-                away_mot = get_team_motivation(away, league_id)
-                avg_goals = ((home_stats["scored_avg"] + away_stats["conceded_avg"])/2) * home_mot * away_mot
-                odds = get_real_odds(home, away)
-                weather_factor = get_weather_factor(event.get("strVenue","London"))
-                injury_factor = (get_injuries_factor(home) + get_injuries_factor(away))/2
+    for league_id in LEAGUES.values():
+        url = f"https://v3.football.api-sports.io/fixtures?date={today}&league={league_id}&season=2025"
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        if not data or not data.get("response"):
+            continue
+        for e in data["response"]:
+            fixture = e["fixture"]
+            stadium = fixture.get("venue") or {}
+            matches.append({
+                "league": e["league"]["name"],
+                "home": e["teams"]["home"]["name"],
+                "away": e["teams"]["away"]["name"],
+                "home_id": e["teams"]["home"]["id"],
+                "away_id": e["teams"]["away"]["id"],
+                "date": fixture["date"],
+                "time": fixture["timestamp"],
+                "referee": fixture.get("referee") or "Unknown",
+                "stadium_city": stadium.get("city", "London"),
+                "avg_goals": 2.6,
+                "home_rank": e["teams"]["home"].get("rank", 10),
+                "away_rank": e["teams"]["away"].get("rank", 10),
+                "odds": 1.85
+            })
+    return matches
 
-                matches.append({
-                    "home": home,
-                    "away": away,
-                    "avg_goals": avg_goals,
-                    "odds": odds,
-                    "h2h_prob": h2h_prob,
-                    "motivation_prob": (home_mot + away_mot)/2,
-                    "weather_factor": weather_factor,
-                    "injury_factor": injury_factor,
-                    "dateEvent": event.get("dateEvent"),
-                    "strTime": event.get("strTime")
-                })
-        print(f"DEBUG: {len(matches)} matches fetched")
-        return matches
-    except Exception as ex:
-        print("get_today_matches error:", ex)
-        return []
+def predict_goals(avg):
+    return {"market": "ТБ 2.5" if avg >= 2.7 else "ТМ 2.5", "type": "goals", "base_prob": 0.68 if avg >= 2.7 else 0.66}
 
-# ================= ОТПРАВКА СИГНАЛОВ =================
-async def send_signals(app):
-    if not CHAT_ID:
-        print("ERROR: CHAT_ID is not set")
-        return
+def predict_cards():
+    return {"market": "ТБ 4.5 ЖК", "type": "cards", "base_prob": 0.70}
 
+def calculate_value(prob, odds):
+    return prob * odds - 1
+
+# ==============================
+# КОМАНДЫ
+# ==============================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🐺 ЦЕРБЕР активирован.\n"
+        "Сигналы приходят ежедневно в 10:00 МСК.\n"
+        "Используй /signals для ручного запроса."
+    )
+
+async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    refs = load_referees()
     matches = get_today_matches()
     if not matches:
-        await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
+        await update.message.reply_text("Сегодня матчей не найдено.")
         return
 
-    message = "🐺 ЦЕРБЕР | СИГНАЛЫ (Value > 0)\n\n"
+    message = "⚡️ СИГНАЛЫ ЦЕРБЕРА:\n\n"
     found = False
-    for match in matches:
-        for pred in [predict_goals(match["avg_goals"]), predict_corners(), predict_cards()]:
-            if pred:
-                probability = compute_probability(
-                    pred["probability"],
-                    match["h2h_prob"],
-                    match["motivation_prob"],
-                    match["weather_factor"],
-                    match["injury_factor"]
-                )
-                value = calculate_value(probability, match["odds"])
-                try:
-                    match_time_utc = datetime.strptime(match["dateEvent"] + " " + match["strTime"], "%Y-%m-%d %H:%M:%S")
-                    match_time_msk = match_time_utc + timedelta(hours=3)
-                    match_time_formatted = match_time_msk.strftime("%H:%M MSK")
-                except:
-                    match_time_formatted = "??:?? MSK"
 
-                if value > 0:
-                    low_prob_mark = " ⚠️ Низкая вероятность" if probability < MIN_PROBABILITY else ""
-                    found = True
-                    message += (
-                        f"⚽ {match['home']} — {match['away']} ({match_time_formatted}){low_prob_mark}\n"
-                        f"{pred['market']}\n"
-                        f"Вероятность: {int(probability*100)}%\n"
-                        f"Коэфф.: {match['odds']}\n"
-                        f"Value: +{value:.2f}\n\n"
-                    )
+    for m in matches:
+        t_msk = datetime.utcfromtimestamp(m["time"]) + timedelta(hours=3)
+        t_msk_str = t_msk.strftime("%H:%M МСК")
+
+        ref_data = referee_avg(refs, m["referee"])
+        weather_factor = get_weather_factor(m["stadium_city"])
+        motivation = get_motivation(m["home_rank"], m["away_rank"])
+        home_form = get_form_factor(m["home_id"])
+        away_form = get_form_factor(m["away_id"])
+        home_inj = get_injuries_factor(m["home_id"])
+        away_inj = get_injuries_factor(m["away_id"])
+        form_inj_factor = (home_form * away_form * home_inj * away_inj)
+
+        for pred in [predict_goals(m["avg_goals"]), predict_cards()]:
+            if pred["type"] == "cards" and (not ref_data or ref_data["yellow_avg"] < MIN_REF_YELLOW):
+                continue
+
+            prob = pred["base_prob"] * motivation * weather_factor * referee_factor(ref_data, pred["type"]) * form_inj_factor
+            value = calculate_value(prob, m["odds"])
+
+            if prob >= MIN_PROBABILITY and value > 0:
+                found = True
+                message += (
+                    f"⚽ {m['home']} — {m['away']} ({t_msk_str})\n"
+                    f"{pred['market']}\n"
+                    f"🧑‍⚖️ Судья: {m['referee']} — {referee_label(ref_data)}\n"
+                    f"Вероятность: {int(prob*100)}%\nКоэфф.: {m['odds']}\nValue: +{value:.2f}\n\n"
+                )
 
     if not found:
-        message += "Сегодня нет value-сигналов."
-    await app.bot.send_message(chat_id=CHAT_ID, text=message)
+        message = "Сегодня нет value-сигналов от 75% 🐺"
 
-# ================= ДНЕВНАЯ ЗАДАЧА =================
-async def daily_task(app):
-    while True:
-        now = datetime.utcnow()
-        target_time = datetime.combine(now.date(), time(10,0))
-        if now > target_time:
-            target_time += timedelta(days=1)
-        wait_seconds = (target_time - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-        await send_signals(app)
+    await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
-# ================= КОМАНДЫ =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🐺 ЦЕРБЕР активирован! Сигналы будут приходить ежедневно в 10:00 UTC.")
+# ==============================
+# ЗАПУСК
+# ==============================
 
-async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("DEBUG: /signals command called")
-    await send_signals(context.application)
-
-# ================= ЗАПУСК =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signals", signals_command))
-    loop = asyncio.get_event_loop()
-    loop.create_task(daily_task(app))
+    app.add_handler(CommandHandler("signals", signals))
+    job_queue = app.job_queue
+    job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
 
