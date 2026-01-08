@@ -13,6 +13,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeather ключ
+
 MIN_PROBABILITY = 0.75
 MIN_REF_YELLOW = 4.5
 REF_FILE = "referees.json"
@@ -125,27 +126,23 @@ def get_motivation(home_rank, away_rank):
 # ==============================
 
 def get_form_factor(team_id):
-    """Оценивает форму команды (победы/ничьи/поражения последние 5 матчей)"""
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     url = f"https://v3.football.api-sports.io/teams/form?team={team_id}&last=5"
     try:
         r = requests.get(url, headers=headers, timeout=10).json()
         form = r.get("response", [])
         wins = sum(1 for x in form if x["win"] == "Win")
-        factor = 1.0 + (wins * 0.02)  # каждая победа +2% к вероятности
-        return factor
+        return 1.0 + (wins * 0.02)
     except:
         return 1.0
 
 def get_injuries_factor(team_id):
-    """Уменьшает вероятность из-за травм"""
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     url = f"https://v3.football.api-sports.io/players/injuries?team={team_id}"
     try:
         r = requests.get(url, headers=headers, timeout=10).json()
         injuries = len(r.get("response", []))
-        factor = 1.0 - min(0.1, injuries*0.02)  # максимум -10%
-        return factor
+        return 1.0 - min(0.1, injuries*0.02)
     except:
         return 1.0
 
@@ -157,14 +154,10 @@ def get_finished_matches_api():
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
     yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     finished = []
-
     for league_id in LEAGUES.values():
         url = f"https://v3.football.api-sports.io/fixtures?date={yesterday}&league={league_id}&season=2025"
-        r = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
-        if not data or not data.get("response"):
-            continue
-        for e in data["response"]:
+        r = requests.get(url, headers=headers, timeout=15).json()
+        for e in r.get("response", []):
             fixture = e["fixture"]
             cards = e.get("cards", [])
             penalties = e.get("penalty", [])
@@ -195,14 +188,10 @@ def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
     matches = []
     headers = {"x-apisports-key": FOOTBALL_API_KEY}
-
     for league_id in LEAGUES.values():
         url = f"https://v3.football.api-sports.io/fixtures?date={today}&league={league_id}&season=2025"
-        r = requests.get(url, headers=headers, timeout=15)
-        data = r.json()
-        if not data or not data.get("response"):
-            continue
-        for e in data["response"]:
+        r = requests.get(url, headers=headers, timeout=15).json()
+        for e in r.get("response", []):
             fixture = e["fixture"]
             stadium = fixture.get("venue") or {}
             matches.append({
@@ -290,14 +279,20 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ==============================
 
-def main():
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Хэндлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
-    job_queue = app.job_queue
-    job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
-    app.run_polling()
+
+    # JobQueue для автообновления судей
+    app.job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
+
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
+
 
