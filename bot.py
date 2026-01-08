@@ -1,13 +1,16 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, time, timedelta
+import asyncio
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")  # ключ OddsPapi
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")  # OddsPapi
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")  # OpenWeatherMap
 
 MIN_PROBABILITY = 0.75
 MIN_VALUE = 0.05
@@ -20,50 +23,43 @@ LEAGUES = {
     "Russian Premier League": 4398
 }
 
-# ================= ПРОГНОЗЫ =================
+# ================= ФУНКЦИИ ПРОГНОЗОВ =================
 def calculate_value(probability, odds):
     return probability * odds - 1
 
+# многомодельная вероятность
+def compute_probability(stat_prob, h2h_prob, motivation_prob, weather_factor):
+    # весовые коэффициенты: статистика 50%, H2H 20%, мотивация 20%, погода 10%
+    prob = stat_prob*0.5 + h2h_prob*0.2 + motivation_prob*0.2
+    prob *= weather_factor
+    return prob
+
 def predict_goals(avg_goals):
     if avg_goals >= 3.0:
-        probability = 0.78
-        market = "ТБ 2.5"
+        return {"market": "ТБ 2.5", "probability": 0.78}
     elif avg_goals <= 2.0:
-        probability = 0.76
-        market = "ТМ 2.5"
-    else:
-        return None
-    return {"market": market, "probability": probability}
+        return {"market": "ТМ 2.5", "probability": 0.76}
+    return None
 
 def predict_corners():
-    probability = 0.77
-    market = "ТБ 8.5 угловых"
-    return {"market": market, "probability": probability}
+    return {"market": "ТБ 8.5 угловых", "probability": 0.77}
 
 def predict_cards():
-    probability = 0.79
-    market = "ТБ 4.5 ЖК"
-    return {"market": market, "probability": probability}
+    return {"market": "ТБ 4.5 ЖК", "probability": 0.79}
 
 # ================= СТАТИСТИКА =================
-def get_team_stats(team_name):
+def get_team_stats(team_name, last_n=10):
     search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
-    resp = requests.get(search_url, params={"t": team_name}, timeout=10)
-    data = resp.json()
-    if not data.get("teams"):
+    resp = requests.get(search_url, params={"t": team_name}, timeout=10).json()
+    if not resp.get("teams"):
         return {"scored_avg": 1.5, "conceded_avg": 1.5}
-
-    team_id = data["teams"][0]["idTeam"]
+    team_id = resp["teams"][0]["idTeam"]
     events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
-    events_data = requests.get(events_url, timeout=10).json()
-    events = events_data.get("results", [])
-    if not events:
-        return {"scored_avg": 1.5, "conceded_avg": 1.5}
-
+    events = requests.get(events_url, timeout=10).json().get("results", [])
     scored = 0
     conceded = 0
-    n = min(len(events), 5)
-    for e in events[:5]:
+    n = min(len(events), last_n)
+    for e in events[:n]:
         home_team = e.get("strHomeTeam")
         away_team = e.get("strAwayTeam")
         home_score = int(e.get("intHomeScore") or 0)
@@ -76,20 +72,30 @@ def get_team_stats(team_name):
             conceded += home_score
     return {"scored_avg": scored/n, "conceded_avg": conceded/n}
 
+# ================= H2H =================
+def get_h2h_probability(home, away, last_n=5):
+    url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsh2h.php"
+    params = {"h": home, "a": away}
+    events = requests.get(url, params=params, timeout=10).json().get("results", [])
+    if not events:
+        return 0.5
+    home_wins = sum(1 for e in events[:last_n] if (e["strHomeTeam"]==home and int(e.get("intHomeScore") or 0) > int(e.get("intAwayScore") or 0)) or 
+                                                (e["strAwayTeam"]==home and int(e.get("intAwayScore") or 0) > int(e.get("intHomeScore") or 0)))
+    return home_wins/last_n
+
 # ================= МОТИВАЦИЯ =================
 def get_team_motivation(team_name, league_id):
     table_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookuptable.php"
     params = {"l": league_id, "s": "2025-2026"}
     try:
-        resp = requests.get(table_url, params=params, timeout=10).json()
-        table = resp.get("table", [])
+        table = requests.get(table_url, params=params, timeout=10).json().get("table", [])
         for team in table:
             if team_name.lower() == team.get("name").lower():
                 pos = int(team.get("intRank") or 999)
                 total = len(table)
-                if pos <= 3 or pos >= total-2:  # титул/выживание
+                if pos <= 3 or pos >= total-2:
                     return 1.12
-                elif pos in [4,5,6]:  # еврокубки
+                elif pos in [4,5,6]:
                     return 1.08
                 else:
                     return 1.0
@@ -97,24 +103,33 @@ def get_team_motivation(team_name, league_id):
         return 1.0
     return 1.0
 
-# ================= ODDSPAPI =================
-def get_real_odds(home, away):
-    """Запрос к OddsPapi для коэффициентов на матч"""
-    if not ODDS_API_KEY:
-        return 1.85  # fallback коэффициент
+# ================= ПОГОДА =================
+def get_weather_factor(city_name):
+    if not WEATHER_API_KEY:
+        return 1.0
     try:
-        url = f"https://api.oddspapi.io/v4/odds"
-        params = {
-            "sport": "soccer",
-            "region": "eu",
-            "mkt": "totals",
-            "apiKey": ODDS_API_KEY
-        }
+        url = f"http://api.openweathermap.org/data/2.5/weather"
+        params = {"q": city_name, "appid": WEATHER_API_KEY, "units":"metric"}
         resp = requests.get(url, params=params, timeout=10).json()
-        # ищем матч по названиям команд
+        weather = resp.get("weather", [{}])[0].get("main","Clear").lower()
+        if weather in ["rain","snow","thunderstorm"]:
+            return 0.9
+        elif weather in ["clear","clouds"]:
+            return 1.0
+        return 1.0
+    except:
+        return 1.0
+
+# ================= OddsPapi =================
+def get_real_odds(home, away):
+    if not ODDS_API_KEY:
+        return 1.85
+    try:
+        url = "https://api.oddspapi.io/v4/odds"
+        params = {"sport":"soccer","region":"eu","mkt":"totals","apiKey":ODDS_API_KEY}
+        resp = requests.get(url, params=params, timeout=10).json()
         for event in resp.get("data", []):
             if home.lower() in event.get("home_team","").lower() and away.lower() in event.get("away_team","").lower():
-                # берём средний коэффициент ТБ/ТМ 2.5
                 odds_list = event.get("odds", [])
                 if odds_list:
                     return float(odds_list[0].get("odd",1.85))
@@ -140,71 +155,74 @@ def get_today_matches():
             away = event.get("strAwayTeam")
             league_id = LEAGUES[league_name]
 
-            # статистика и мотивация
             home_stats = get_team_stats(home)
             away_stats = get_team_stats(away)
+            h2h_prob = get_h2h_probability(home, away)
             home_mot = get_team_motivation(home, league_id)
             away_mot = get_team_motivation(away, league_id)
+            weather_factor = get_weather_factor(event.get("strVenue","London"))
             avg_goals = ((home_stats["scored_avg"] + away_stats["conceded_avg"])/2) * home_mot * away_mot
-
-            # реальные odds
             odds = get_real_odds(home, away)
 
             matches.append({
                 "home": home,
                 "away": away,
                 "avg_goals": avg_goals,
-                "odds": odds
+                "odds": odds,
+                "h2h_prob": h2h_prob,
+                "weather_factor": weather_factor,
+                "motivation_prob": (home_mot + away_mot)/2
             })
     return matches
 
-# ================= TELEGRAM =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🐺 ЦЕРБЕР активирован.\n\n"
-        "Сигналы публикуются только при:\n"
-        "• вероятности от 75%\n"
-        "• положительном value\n\n"
-        "/signals — сигналы"
-    )
-
-async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        matches = get_today_matches()
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка при получении матчей: {e}")
-        return
+# ================= ОТПРАВКА СИГНАЛОВ =================
+async def send_signals(app):
+    matches = get_today_matches()
     if not matches:
-        await update.message.reply_text("Сегодня подходящих матчей нет.")
+        await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
         return
 
     message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
     found = False
-
     for match in matches:
         for pred in [predict_goals(match["avg_goals"]), predict_corners(), predict_cards()]:
             if pred:
-                value = calculate_value(pred["probability"], match["odds"])
-                if pred["probability"] >= MIN_PROBABILITY and value > 0:
+                probability = compute_probability(pred["probability"], match["h2h_prob"], match["motivation_prob"], match["weather_factor"])
+                value = calculate_value(probability, match["odds"])
+                if probability >= MIN_PROBABILITY and value > 0:
                     found = True
                     message += (
                         f"⚽ {match['home']} — {match['away']}\n"
                         f"{pred['market']}\n"
-                        f"Вероятность: {int(pred['probability']*100)}%\n"
+                        f"Вероятность: {int(probability*100)}%\n"
                         f"Коэфф.: {match['odds']}\n"
                         f"Value: +{value:.2f}\n\n"
                     )
     if not found:
         message += "Сегодня нет value-сигналов от 75%."
-    await update.message.reply_text(message)
 
-# ================= ЗАПУСК БОТА =================
+    await app.bot.send_message(chat_id=CHAT_ID, text=message)
+
+# ================= ДНЕВНАЯ ЗАДАЧА =================
+async def daily_task(app):
+    while True:
+        now = datetime.utcnow()
+        target_time = datetime.combine(now.date(), time(10,0))
+        if now > target_time:
+            target_time += timedelta(days=1)
+        wait_seconds = (target_time - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        await send_signals(app)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🐺 ЦЕРБЕР активирован! Сигналы будут приходить ежедневно в 10:00 UTC.")
+
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signals", signals))
+    loop = asyncio.get_event_loop()
+    loop.create_task(daily_task(app))
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
