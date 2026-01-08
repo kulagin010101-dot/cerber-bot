@@ -4,20 +4,21 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY")
+
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не задан! Проверь переменные окружения Railway.")
+if not THESPORTSDB_API_KEY:
+    raise ValueError("❌ THESPORTSDB_API_KEY не задан! Проверь переменные окружения Railway.")
 
-# Топ-лиги и условные internal IDs (для примера, можно заменить на реальные)
+# Ссылки на топ-лиги TheSportsDB
 LEAGUES = {
-    "Англия — Премьер-лига": "1",
-    "Испания — Ла Лига": "2",
-    "Италия — Серия A": "3",
-    "Германия — Бундеслига": "4",
-    "Россия — РПЛ": "5"
+    "Англия — Премьер-лига": "4328",
+    "Испания — Ла Лига": "4335",
+    "Италия — Серия A": "4332",
+    "Германия — Бундеслига": "4331",
+    "Россия — РПЛ": "4394"
 }
-
-# Временный JSON FlashScore для примера (реальный endpoint нужно заменить)
-FLASH_URL = "https://d.flashscore.com/x/feed/0_football_en_uk.js"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -28,36 +29,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = "⚽️ Ближайшие матчи:\n\n"
+    found = False
+
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(FLASH_URL, headers=headers)
-        resp.raise_for_status()
-        text = resp.text
-
-        # FlashScore JSON приходит как JS-переменная
-        start_idx = text.find("window['fsFeed'] = ") + len("window['fsFeed'] = ")
-        end_idx = text.rfind(";")
-        json_text = text[start_idx:end_idx]
-
-        import json
-        data = json.loads(json_text)
-
-        found = False
         for league_name, league_id in LEAGUES.items():
-            matches = []
-            for ev in data.get("events", []):
-                if ev.get("leagueId") == league_id:
-                    home = ev.get("homeTeam", {}).get("name", "")
-                    away = ev.get("awayTeam", {}).get("name", "")
-                    time = ev.get("startTime", "")
-                    if home and away and time:
-                        matches.append({"home": home, "away": away, "time": time})
+            url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsnextleague.php?id={league_id}"
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
 
-            if matches:
+            if "events" in data and data["events"]:
                 message += f"{league_name}:\n"
-                for m in matches[:10]:
-                    # без Markdown, спецсимволы не ломают сообщение
-                    message += f"{m['time']} — {m['home']} vs {m['away']}\n"
+                for match in data["events"][:10]:  # ближайшие 10 матчей
+                    date = match.get("dateEvent", "")
+                    time = match.get("strTime", "")
+                    home = match.get("strHomeTeam", "")
+                    away = match.get("strAwayTeam", "")
+                    message += f"{date} {time} — {home} vs {away}\n"
                 message += "\n"
                 found = True
             else:
@@ -69,7 +57,6 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         message = f"❌ Ошибка при получении матчей: {e}"
 
-    # просто plain text
     await update.message.reply_text(message)
 
 def main():
@@ -80,5 +67,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
