@@ -7,13 +7,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # Обязательно число!
 THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
 MIN_PROBABILITY = 0.75
-MIN_VALUE = 0.05
 
 LEAGUES = {
     "English Premier League": 4328,
@@ -70,7 +69,8 @@ def get_team_stats(team_name, last_n=10):
                 scored += away_score
                 conceded += home_score
         return {"scored_avg": scored/n, "conceded_avg": conceded/n}
-    except:
+    except Exception as ex:
+        print("get_team_stats error:", ex)
         return {"scored_avg": 1.5, "conceded_avg": 1.5}
 
 # ================= H2H =================
@@ -84,7 +84,8 @@ def get_h2h_probability(home, away, last_n=5):
         home_wins = sum(1 for e in events[:last_n] if (e["strHomeTeam"]==home and int(e.get("intHomeScore") or 0) > int(e.get("intAwayScore") or 0)) or 
                                                   (e["strAwayTeam"]==home and int(e.get("intAwayScore") or 0) > int(e.get("intHomeScore") or 0)))
         return home_wins/last_n
-    except:
+    except Exception as ex:
+        print("get_h2h_probability error:", ex)
         return 0.5
 
 # ================= МОТИВАЦИЯ =================
@@ -103,7 +104,8 @@ def get_team_motivation(team_name, league_id):
                     return 1.08
                 else:
                     return 1.0
-    except:
+    except Exception as ex:
+        print("get_team_motivation error:", ex)
         return 1.0
     return 1.0
 
@@ -126,7 +128,8 @@ def get_injuries_factor(team_name):
             elif "suspended" in status:
                 factor *= 0.80
         return factor
-    except:
+    except Exception as ex:
+        print("get_injuries_factor error:", ex)
         return 1.0
 
 # ================= ПОГОДА =================
@@ -143,7 +146,8 @@ def get_weather_factor(city_name):
         elif weather in ["clear","clouds"]:
             return 1.0
         return 1.0
-    except:
+    except Exception as ex:
+        print("get_weather_factor error:", ex)
         return 1.0
 
 # ================= OddsPapi =================
@@ -159,8 +163,8 @@ def get_real_odds(home, away):
                 odds_list = event.get("odds", [])
                 if odds_list:
                     return float(odds_list[0].get("odd",1.85))
-    except:
-        pass
+    except Exception as ex:
+        print("get_real_odds error:", ex)
     return 1.85
 
 # ================= МАТЧИ =================
@@ -204,12 +208,18 @@ def get_today_matches():
                     "dateEvent": event.get("dateEvent"),
                     "strTime": event.get("strTime")
                 })
+        print(f"DEBUG: {len(matches)} matches fetched")
         return matches
-    except:
+    except Exception as ex:
+        print("get_today_matches error:", ex)
         return []
 
 # ================= ОТПРАВКА СИГНАЛОВ =================
 async def send_signals(app):
+    if not CHAT_ID:
+        print("ERROR: CHAT_ID is not set")
+        return
+
     matches = get_today_matches()
     if not matches:
         await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
@@ -228,7 +238,6 @@ async def send_signals(app):
                     match["injury_factor"]
                 )
                 value = calculate_value(probability, match["odds"])
-                # конвертация времени в MSK
                 try:
                     match_time_utc = datetime.strptime(match["dateEvent"] + " " + match["strTime"], "%Y-%m-%d %H:%M:%S")
                     match_time_msk = match_time_utc + timedelta(hours=3)
@@ -265,6 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🐺 ЦЕРБЕР активирован! Сигналы будут приходить ежедневно в 10:00 UTC.")
 
 async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("DEBUG: /signals command called")
     await send_signals(context.application)
 
 # ================= ЗАПУСК =================
