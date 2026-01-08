@@ -1,70 +1,113 @@
 import os
-import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
+# ====== НАСТРОЙКИ ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY")
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не задан! Проверь переменные окружения Railway.")
-if not THESPORTSDB_API_KEY:
-    raise ValueError("❌ THESPORTSDB_API_KEY не задан! Проверь переменные окружения Railway.")
+MIN_PROBABILITY = 0.75
+MIN_VALUE = 0.05
 
-# Ссылки на топ-лиги TheSportsDB
-LEAGUES = {
-    "Англия — Премьер-лига": "4328",
-    "Испания — Ла Лига": "4335",
-    "Италия — Серия A": "4332",
-    "Германия — Бундеслига": "4331",
-    "Россия — РПЛ": "4394"
-}
 
+# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+def calculate_value(probability, odds):
+    return probability * odds - 1
+
+
+def predict_goals(avg_goals):
+    if avg_goals >= 3.0:
+        probability = 0.78
+        market = "ТБ 2.5"
+        odds = 1.85
+    else:
+        return None
+
+    value = calculate_value(probability, odds)
+
+    if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
+        return {
+            "market": market,
+            "probability": probability,
+            "odds": odds,
+            "value": value
+        }
+    return None
+
+
+def predict_corners():
+    probability = 0.77
+    market = "ТБ 8.5 угловых"
+    odds = 1.80
+    value = calculate_value(probability, odds)
+
+    if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
+        return {
+            "market": market,
+            "probability": probability,
+            "odds": odds,
+            "value": value
+        }
+    return None
+
+
+def predict_cards():
+    probability = 0.79
+    market = "ТБ 4.5 ЖК"
+    odds = 1.85
+    value = calculate_value(probability, odds)
+
+    if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
+        return {
+            "market": market,
+            "probability": probability,
+            "odds": odds,
+            "value": value
+        }
+    return None
+
+
+# ====== КОМАНДЫ TELEGRAM ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР активирован!\n\n"
+        "🐺 ЦЕРБЕР активирован.\n\n"
+        "Я публикую только СИЛЬНЫЕ сигналы:\n"
+        "• вероятность от 75%\n"
+        "• только value-события\n\n"
         "Команды:\n"
-        "/today — ближайшие матчи топ-лиг"
+        "/signals — сигналы ЦЕРБЕРА"
     )
 
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = "⚽️ Ближайшие матчи:\n\n"
-    found = False
 
-    try:
-        for league_name, league_id in LEAGUES.items():
-            url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsnextleague.php?id={league_id}"
-            response = requests.get(url)
-            response.raise_for_status()
-            data = response.json()
+async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
 
-            if "events" in data and data["events"]:
-                message += f"{league_name}:\n"
-                for match in data["events"][:10]:  # ближайшие 10 матчей
-                    date = match.get("dateEvent", "")
-                    time = match.get("strTime", "")
-                    home = match.get("strHomeTeam", "")
-                    away = match.get("strAwayTeam", "")
-                    message += f"{date} {time} — {home} vs {away}\n"
-                message += "\n"
-                found = True
-            else:
-                message += f"{league_name}: матчи не найдены\n\n"
+    # ТЕСТОВЫЙ МАТЧ (пока без API)
+    match = {
+        "home": "Arsenal",
+        "away": "Tottenham",
+        "avg_goals": 3.1
+    }
 
-        if not found:
-            message += "Матчи не найдены."
+    signals_found = False
 
-    except Exception as e:
-        message = f"❌ Ошибка при получении матчей: {e}"
+    for sig in [
+        predict_goals(match["avg_goals"]),
+        predict_corners(),
+        predict_cards()
+    ]:
+        if sig:
+            signals_found = True
+            message += (
+                f"⚽ {match['home']} — {match['away']}\n"
+                f"Рынок: {sig['market']}\n"
+                f"Вероятность: {int(sig['probability'] * 100)}%\n"
+                f"Коэффициент: {sig['odds']}\n"
+                f"Value: +{sig['value']:.2f}\n\n"
+            )
 
-    await update.message.reply_text(message)
+    if not signals_found:
+        message += "Сегодня сильных сигналов нет."
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("today", today))
-    app.run_polling()
+    await update.message.re
 
-if __name__ == "__main__":
-    main()
 
