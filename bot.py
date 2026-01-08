@@ -1,15 +1,24 @@
 import os
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ====== НАСТРОЙКИ ======
+# ================= НАСТРОЙКИ =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
 
 MIN_PROBABILITY = 0.75
 MIN_VALUE = 0.05
 
+TOP_LEAGUES = [
+    "English Premier League",
+    "Spanish La Liga",
+    "Italian Serie A",
+    "German Bundesliga",
+    "Russian Premier League"
+]
 
-# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
 def calculate_value(probability, odds):
     return probability * odds - 1
 
@@ -66,11 +75,40 @@ def predict_cards():
     return None
 
 
-# ====== КОМАНДЫ TELEGRAM ======
+def get_today_matches():
+    url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsday.php"
+    params = {
+        "d": "today",
+        "s": "Soccer"
+    }
+
+    response = requests.get(url, params=params, timeout=10)
+    response.raise_for_status()
+    data = response.json()
+
+    matches = []
+
+    if not data or not data.get("events"):
+        return matches
+
+    for event in data["events"]:
+        league = event.get("strLeague")
+        if league in TOP_LEAGUES:
+            matches.append({
+                "home": event.get("strHomeTeam"),
+                "away": event.get("strAwayTeam"),
+                # ВРЕМЕННО: средний тотал (улучшим на шаге 2)
+                "avg_goals": 2.8
+            })
+
+    return matches
+
+
+# ================= КОМАНДЫ TELEGRAM =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
-        "Я публикую только СИЛЬНЫЕ сигналы:\n"
+        "Я публикую только сильные сигналы:\n"
         "• вероятность от 75%\n"
         "• только value-события\n\n"
         "Команды:\n"
@@ -79,43 +117,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        matches = get_today_matches()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при получении матчей: {e}")
+        return
+
+    if not matches:
+        await update.message.reply_text("Сегодня матчей не найдено.")
+        return
+
     message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
-
-    # ТЕСТОВЫЙ МАТЧ (пока без API)
-    match = {
-        "home": "Arsenal",
-        "away": "Tottenham",
-        "avg_goals": 3.1
-    }
-
     signals_found = False
 
-    for sig in [
-        predict_goals(match["avg_goals"]),
-        predict_corners(),
-        predict_cards()
-    ]:
-        if sig:
-            signals_found = True
-            message += (
-                f"⚽ {match['home']} — {match['away']}\n"
-                f"Рынок: {sig['market']}\n"
-                f"Вероятность: {int(sig['probability'] * 100)}%\n"
-                f"Коэффициент: {sig['odds']}\n"
-                f"Value: +{sig['value']:.2f}\n\n"
-            )
+    for match in matches:
+        signals = [
+            predict_goals(match["avg_goals"]),
+            predict_corners(),
+            predict_cards()
+        ]
+
+        for sig in signals:
+            if sig:
+                signals_found = True
+                message += (
+                    f"⚽ {match['home']} — {match['away']}\n"
+                    f"Рынок: {sig['market']}\n"
+                    f"Вероятность: {int(sig['probability'] * 100)}%\n"
+                    f"Коэффициент: {sig['odds']}\n"
+                    f"Value: +{sig['value']:.2f}\n\n"
+                )
 
     if not signals_found:
-        message += "Сегодня сильных сигналов нет."
+        message += "Сегодня нет value-сигналов от 75%."
 
     await update.message.reply_text(message)
 
 
-# ====== ЗАПУСК БОТА ======
+# ================= ЗАПУСК БОТА =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # 🔗 РЕГИСТРАЦИЯ ХЭНДЛЕРОВ (ОЧЕНЬ ВАЖНО)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
 
@@ -124,5 +166,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
