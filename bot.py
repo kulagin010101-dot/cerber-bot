@@ -1,5 +1,6 @@
 import os
 import requests
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -18,7 +19,7 @@ TOP_LEAGUES = [
     "Russian Premier League"
 ]
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
+# ================= ПРОГНОЗЫ =================
 def calculate_value(probability, odds):
     return probability * odds - 1
 
@@ -32,7 +33,6 @@ def predict_goals(avg_goals):
         return None
 
     value = calculate_value(probability, odds)
-
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
         return {
             "market": market,
@@ -48,7 +48,6 @@ def predict_corners():
     market = "ТБ 8.5 угловых"
     odds = 1.80
     value = calculate_value(probability, odds)
-
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
         return {
             "market": market,
@@ -64,7 +63,6 @@ def predict_cards():
     market = "ТБ 4.5 ЖК"
     odds = 1.85
     value = calculate_value(probability, odds)
-
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
         return {
             "market": market,
@@ -75,44 +73,50 @@ def predict_cards():
     return None
 
 
+# ================= МАТЧИ =================
 def get_today_matches():
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
     url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventsday.php"
     params = {
-        "d": "today",
+        "d": today,
         "s": "Soccer"
     }
 
     response = requests.get(url, params=params, timeout=10)
-    response.raise_for_status()
+
+    # ❗ защита от пустого ответа
+    if response.text.strip() == "":
+        return []
+
     data = response.json()
 
     matches = []
+    events = data.get("events")
 
-    if not data or not data.get("events"):
-        return matches
+    if not events:
+        return []
 
-    for event in data["events"]:
+    for event in events:
         league = event.get("strLeague")
         if league in TOP_LEAGUES:
             matches.append({
                 "home": event.get("strHomeTeam"),
                 "away": event.get("strAwayTeam"),
-                # ВРЕМЕННО: средний тотал (улучшим на шаге 2)
-                "avg_goals": 2.8
+                "avg_goals": 2.8  # временно
             })
 
     return matches
 
 
-# ================= КОМАНДЫ TELEGRAM =================
+# ================= TELEGRAM =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
-        "Я публикую только сильные сигналы:\n"
-        "• вероятность от 75%\n"
-        "• только value-события\n\n"
-        "Команды:\n"
-        "/signals — сигналы ЦЕРБЕРА"
+        "Сигналы публикуются только при:\n"
+        "• вероятности от 75%\n"
+        "• положительном value\n\n"
+        "/signals — сигналы"
     )
 
 
@@ -124,46 +128,40 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not matches:
-        await update.message.reply_text("Сегодня матчей не найдено.")
+        await update.message.reply_text("Сегодня подходящих матчей нет.")
         return
 
     message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
-    signals_found = False
+    found = False
 
     for match in matches:
-        signals = [
+        for sig in [
             predict_goals(match["avg_goals"]),
             predict_corners(),
             predict_cards()
-        ]
-
-        for sig in signals:
+        ]:
             if sig:
-                signals_found = True
+                found = True
                 message += (
                     f"⚽ {match['home']} — {match['away']}\n"
-                    f"Рынок: {sig['market']}\n"
-                    f"Вероятность: {int(sig['probability'] * 100)}%\n"
-                    f"Коэффициент: {sig['odds']}\n"
+                    f"{sig['market']}\n"
+                    f"Вероятность: {int(sig['probability']*100)}%\n"
+                    f"Коэфф.: {sig['odds']}\n"
                     f"Value: +{sig['value']:.2f}\n\n"
                 )
 
-    if not signals_found:
+    if not found:
         message += "Сегодня нет value-сигналов от 75%."
 
     await update.message.reply_text(message)
 
 
-# ================= ЗАПУСК БОТА =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
-
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
