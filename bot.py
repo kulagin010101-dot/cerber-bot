@@ -12,8 +12,7 @@ THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
 
-MIN_PROBABILITY = 0.75
-
+MIN_PROBABILITY = 0.75  # порог сильных сигналов
 LEAGUES = {
     "English Premier League": 4328,
     "Spanish La Liga": 4335,
@@ -225,7 +224,7 @@ async def send_signals(app):
         await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
         return
 
-    message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
+    message = "🐺 ЦЕРБЕР | СИГНАЛЫ (Value > 0)\n\n"
     found = False
     for match in matches:
         for pred in [predict_goals(match["avg_goals"]), predict_corners(), predict_cards()]:
@@ -245,17 +244,19 @@ async def send_signals(app):
                 except:
                     match_time_formatted = "??:?? MSK"
 
-                if probability >= MIN_PROBABILITY and value > 0:
+                if value > 0:
+                    low_prob_mark = " ⚠️ Низкая вероятность" if probability < MIN_PROBABILITY else ""
                     found = True
                     message += (
-                        f"⚽ {match['home']} — {match['away']} ({match_time_formatted})\n"
+                        f"⚽ {match['home']} — {match['away']} ({match_time_formatted}){low_prob_mark}\n"
                         f"{pred['market']}\n"
                         f"Вероятность: {int(probability*100)}%\n"
                         f"Коэфф.: {match['odds']}\n"
                         f"Value: +{value:.2f}\n\n"
                     )
+
     if not found:
-        message += "Сегодня нет value-сигналов от 75%."
+        message += "Сегодня нет value-сигналов."
     await app.bot.send_message(chat_id=CHAT_ID, text=message)
 
 # ================= ДНЕВНАЯ ЗАДАЧА =================
@@ -288,4 +289,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
