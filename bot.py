@@ -282,17 +282,20 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Хэндлеры
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
 
-    # JobQueue для автообновления судей
-    app.job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
+    # =======================
+    # JobQueue безопасно добавляем через post_init
+    # =======================
+    async def start_jobs(app):
+        app.job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
+
+    app.post_init = start_jobs
 
     await app.run_polling()
 
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-
 
