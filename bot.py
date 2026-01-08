@@ -11,13 +11,14 @@ THESPORTSDB_API_KEY = os.getenv("THESPORTSDB_API_KEY", "1")
 MIN_PROBABILITY = 0.75
 MIN_VALUE = 0.05
 
-TOP_LEAGUES = [
-    "English Premier League",
-    "Spanish La Liga",
-    "Italian Serie A",
-    "German Bundesliga",
-    "Russian Premier League"
-]
+# Лиги и их ID для TheSportsDB
+LEAGUES = {
+    "English Premier League": 4328,
+    "Spanish La Liga": 4335,
+    "Italian Serie A": 4332,
+    "German Bundesliga": 4331,
+    "Russian Premier League": 4398
+}
 
 # ================= ПРОГНОЗЫ =================
 def calculate_value(probability, odds):
@@ -38,12 +39,7 @@ def predict_goals(avg_goals):
 
     value = calculate_value(probability, odds)
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
-        return {
-            "market": market,
-            "probability": probability,
-            "odds": odds,
-            "value": value
-        }
+        return {"market": market, "probability": probability, "odds": odds, "value": value}
     return None
 
 
@@ -53,12 +49,7 @@ def predict_corners():
     odds = 1.80
     value = calculate_value(probability, odds)
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
-        return {
-            "market": market,
-            "probability": probability,
-            "odds": odds,
-            "value": value
-        }
+        return {"market": market, "probability": probability, "odds": odds, "value": value}
     return None
 
 
@@ -68,24 +59,12 @@ def predict_cards():
     odds = 1.85
     value = calculate_value(probability, odds)
     if probability >= MIN_PROBABILITY and value >= MIN_VALUE:
-        return {
-            "market": market,
-            "probability": probability,
-            "odds": odds,
-            "value": value
-        }
+        return {"market": market, "probability": probability, "odds": odds, "value": value}
     return None
 
-# ================= СТАТИСТИКА КОМАНД =================
+# ================= СТАТИСТИКА =================
 def get_team_stats(team_name):
-    """
-    Возвращает словарь:
-    {
-        'scored_avg': средние голы команды за последние 5 матчей,
-        'conceded_avg': средние голы против команды
-    }
-    """
-    # Получаем команду
+    """Последние 5 матчей команды"""
     search_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/searchteams.php"
     search_resp = requests.get(search_url, params={"t": team_name}, timeout=10)
     search_data = search_resp.json()
@@ -94,7 +73,6 @@ def get_team_stats(team_name):
 
     team_id = search_data["teams"][0]["idTeam"]
 
-    # Берём последние 5 матчей
     events_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/eventslast.php?id={team_id}"
     events_resp = requests.get(events_url, timeout=10)
     events_data = events_resp.json()
@@ -107,7 +85,6 @@ def get_team_stats(team_name):
     n = min(len(events), 5)
 
     for e in events[:5]:
-        # Определяем домашнюю/гостевую роль
         home_team = e.get("strHomeTeam")
         away_team = e.get("strAwayTeam")
         home_score = int(e.get("intHomeScore") or 0)
@@ -121,6 +98,31 @@ def get_team_stats(team_name):
             conceded += home_score
 
     return {"scored_avg": scored / n, "conceded_avg": conceded / n}
+
+# ================= МОТИВАЦИЯ =================
+def get_team_motivation(team_name, league_id):
+    """Возвращает множитель мотивации команды от 1.0 до 1.15"""
+    table_url = f"https://www.thesportsdb.com/api/v1/json/{THESPORTSDB_API_KEY}/lookuptable.php"
+    params = {"l": league_id, "s": "2025-2026"}
+    try:
+        resp = requests.get(table_url, params=params, timeout=10)
+        data = resp.json()
+        table = data.get("table", [])
+        for team in table:
+            if team_name.lower() == team.get("name").lower():
+                position = int(team.get("intRank") or 999)
+                total_teams = len(table)
+                if position <= 3:  # борьба за титул
+                    return 1.12
+                elif position >= total_teams - 2:  # выживание
+                    return 1.12
+                elif position in [4,5,6]:  # еврокубки
+                    return 1.08
+                else:
+                    return 1.0
+    except:
+        return 1.0
+    return 1.0
 
 # ================= МАТЧИ =================
 def get_today_matches():
@@ -139,15 +141,22 @@ def get_today_matches():
 
     matches = []
     for event in events:
-        league = event.get("strLeague")
-        if league in TOP_LEAGUES:
+        league_name = event.get("strLeague")
+        if league_name in LEAGUES:
             home = event.get("strHomeTeam")
             away = event.get("strAwayTeam")
+            league_id = LEAGUES[league_name]
 
-            # рассчитываем реальные avg_goals на основе статистики команд
+            # статистика команд
             home_stats = get_team_stats(home)
             away_stats = get_team_stats(away)
-            avg_goals = (home_stats["scored_avg"] + away_stats["conceded_avg"]) / 2
+
+            # мотивация команд
+            home_motivation = get_team_motivation(home, league_id)
+            away_motivation = get_team_motivation(away, league_id)
+
+            # рассчитываем avg_goals с мотивацией
+            avg_goals = ((home_stats["scored_avg"] + away_stats["conceded_avg"]) / 2) * home_motivation * away_motivation
 
             matches.append({
                 "home": home,
@@ -207,3 +216,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
