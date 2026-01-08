@@ -108,6 +108,21 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not signals_found:
         message += "Сегодня сильных сигналов нет."
 
-    await update.message.re
+    await update.message.reply_text(message)
+
+
+# ====== ЗАПУСК БОТА ======
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # 🔗 РЕГИСТРАЦИЯ ХЭНДЛЕРОВ (ОЧЕНЬ ВАЖНО)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signals", signals))
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 
 
