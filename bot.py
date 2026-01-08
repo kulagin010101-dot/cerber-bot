@@ -285,9 +285,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
 
-    # =======================
     # JobQueue безопасно добавляем через post_init
-    # =======================
     async def start_jobs(app):
         app.job_queue.run_daily(update_referees_api_job, time=datetime.strptime("00:00", "%H:%M").time())
 
@@ -295,7 +293,20 @@ async def main():
 
     await app.run_polling()
 
+# ==============================
+# Асинхронный запуск с проверкой event loop
+# ==============================
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # В средах вроде Railway создаем задачу
+        asyncio.create_task(main())
+    else:
+        asyncio.run(main())
+
 
