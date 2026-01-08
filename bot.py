@@ -23,7 +23,7 @@ LEAGUES = {
     "Russian Premier League": 4398
 }
 
-# ================= ФУНКЦИИ ПРОГНОЗОВ =================
+# ================= ФУНКЦИИ =================
 def calculate_value(probability, odds):
     return probability * odds - 1
 
@@ -191,6 +191,7 @@ def get_today_matches():
                 odds = get_real_odds(home, away)
                 weather_factor = get_weather_factor(event.get("strVenue","London"))
                 injury_factor = (get_injuries_factor(home) + get_injuries_factor(away))/2
+
                 matches.append({
                     "home": home,
                     "away": away,
@@ -199,7 +200,9 @@ def get_today_matches():
                     "h2h_prob": h2h_prob,
                     "motivation_prob": (home_mot + away_mot)/2,
                     "weather_factor": weather_factor,
-                    "injury_factor": injury_factor
+                    "injury_factor": injury_factor,
+                    "dateEvent": event.get("dateEvent"),
+                    "strTime": event.get("strTime")
                 })
         return matches
     except:
@@ -211,6 +214,7 @@ async def send_signals(app):
     if not matches:
         await app.bot.send_message(chat_id=CHAT_ID, text="Сегодня подходящих матчей нет.")
         return
+
     message = "🐺 ЦЕРБЕР | СИГНАЛЫ (75%+)\n\n"
     found = False
     for match in matches:
@@ -224,10 +228,18 @@ async def send_signals(app):
                     match["injury_factor"]
                 )
                 value = calculate_value(probability, match["odds"])
+                # конвертация времени в MSK
+                try:
+                    match_time_utc = datetime.strptime(match["dateEvent"] + " " + match["strTime"], "%Y-%m-%d %H:%M:%S")
+                    match_time_msk = match_time_utc + timedelta(hours=3)
+                    match_time_formatted = match_time_msk.strftime("%H:%M MSK")
+                except:
+                    match_time_formatted = "??:?? MSK"
+
                 if probability >= MIN_PROBABILITY and value > 0:
                     found = True
                     message += (
-                        f"⚽ {match['home']} — {match['away']}\n"
+                        f"⚽ {match['home']} — {match['away']} ({match_time_formatted})\n"
                         f"{pred['market']}\n"
                         f"Вероятность: {int(probability*100)}%\n"
                         f"Коэфф.: {match['odds']}\n"
@@ -248,15 +260,22 @@ async def daily_task(app):
         await asyncio.sleep(wait_seconds)
         await send_signals(app)
 
+# ================= КОМАНДЫ =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🐺 ЦЕРБЕР активирован! Сигналы будут приходить ежедневно в 10:00 UTC.")
 
+async def signals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_signals(context.application)
+
+# ================= ЗАПУСК =================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signals", signals_command))
     loop = asyncio.get_event_loop()
     loop.create_task(daily_task(app))
     app.run_polling()
 
 if __name__ == "__main__":
     main()
+
