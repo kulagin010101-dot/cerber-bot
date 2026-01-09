@@ -185,10 +185,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команда: /signals"
     )
 
+# ======================
+# ОТЛАДОЧНЫЕ СИГНАЛЫ — ВЫВОД ВСЕХ МАТЧЕЙ
+# ======================
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures = get_today_matches()
-    msg = "⚽ СИГНАЛЫ ЦЕРБЕРА (ГОЛЫ)\n\n"
-    found = False
+    if not fixtures:
+        await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Сегодня матчей не найдено в API.")
+        return
+
+    msg = "⚽ ПРОВЕРКА СИГНАЛОВ ЦЕРБЕРА (ВСЕ МАТЧИ)\n\n"
     for f in fixtures:
         home = f["teams"]["home"]
         away = f["teams"]["away"]
@@ -206,18 +212,13 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             weather_factor(city),
             referee_factor(referee)
         )
-        if prob >= MIN_PROB:
-            found = True
-            time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
-            msg += (
-                f"{home['name']} — {away['name']}\n"
-                f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
-                f"📊 ТБ 2.5\n"
-                f"Вероятность: {int(prob*100)}%\n\n"
-            )
 
-    if not found:
-        msg = "Сегодня нет value-сигналов от 75% 🐺"
+        time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
+        msg += (
+            f"{home['name']} — {away['name']}\n"
+            f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
+            f"Вероятность ТБ 2.5: {int(prob*100)}%\n\n"
+        )
 
     await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
