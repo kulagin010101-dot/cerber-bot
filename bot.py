@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
@@ -14,7 +15,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 ODDSPAPI_KEY = os.getenv("ODDSPAPI_KEY")
 ODDSPAPI_BOOKMAKER = os.getenv("ODDSPAPI_BOOKMAKER", "1xbet")  # твой тариф: 1xBet
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # опционально
+WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # optional
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан")
@@ -25,20 +26,18 @@ if not ODDSPAPI_KEY:
 
 HEADERS_FOOTBALL = {"x-apisports-key": FOOTBALL_API_KEY}
 
-# Настройки модели
 SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))   # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00")) # value > 0
 
-# sanity-фильтры для odds
 OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.10")), float(os.getenv("OU_ODDS_MAX", "6.00"))
 BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.10")), float(os.getenv("BTTS_ODDS_MAX", "6.00"))
 
 STATE_FILE = "state.json"
 
 # =====================================================
-# TARGET TOURNAMENTS (Oddspapi categories + tournamentName)
-# Важно: названия должны совпадать с Oddspapi /v4/tournaments
+# TARGET TOURNAMENTS (Oddspapi)
+# categoryName + tournamentName
 # =====================================================
 TARGET_TOURNAMENTS_ODDSPAPI = [
     ("England", "Premier League"),
@@ -72,7 +71,7 @@ TARGET_TOURNAMENTS_ODDSPAPI = [
 ]
 
 # =====================================================
-# TARGET LEAGUES (API-Football search by name/country)
+# TARGET LEAGUES (API-Football)
 # =====================================================
 TARGET_COMPETITIONS_API_FOOTBALL: List[Dict[str, Any]] = [
     {"country": "England", "name": "Premier League", "aliases": ["Premier League"]},
@@ -115,8 +114,11 @@ def load_state() -> Dict[str, Any]:
     return {}
 
 def save_state(state: Dict[str, Any]) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] cannot save state: {e}")
 
 STATE = load_state()
 
@@ -196,7 +198,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # =====================================================
-# API-Football: last matches -> simple goal model
+# API-Football: last matches -> goal model
 # =====================================================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -207,8 +209,7 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
             timeout=25
         )
         r.raise_for_status()
-        data = r.json()
-        return data.get("response", [])
+        return r.json().get("response", [])
     except:
         return []
 
@@ -372,16 +373,35 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
     return [], league_ids, missing, date_msk
 
 # =====================================================
-# OddsPapi: requests + caches
+# OddsPapi: GET with retry on 429
 # =====================================================
 def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
+    """
+    OddsPapi GET с обработкой rate-limit (429).
+    При 429 ждём retryMs и повторяем.
+    """
     params = dict(params)
     params["apiKey"] = ODDSPAPI_KEY
     url = f"https://api.oddspapi.io{path}"
-    r = requests.get(url, params=params, timeout=30)
-    if r.status_code >= 400:
-        raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:300]}")
-    return r.json()
+
+    for _attempt in range(6):
+        r = requests.get(url, params=params, timeout=30)
+
+        if r.status_code == 429:
+            try:
+                j = r.json()
+                retry_ms = int(j.get("error", {}).get("retryMs", 250))
+            except:
+                retry_ms = 250
+            time.sleep(max(0.05, retry_ms / 1000.0))
+            continue
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:300]}")
+
+        return r.json()
+
+    raise RuntimeError("OddsPapi: слишком много 429 подряд, попробуй позже.")
 
 # ---- participants cache ----
 PART_CACHE_KEY = "oddspapi_participants_10"
@@ -390,18 +410,16 @@ PART_CACHE_DATE = "oddspapi_participants_10_date"
 def get_participants_map(force: bool = False) -> Dict[str, str]:
     today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
     if not force and STATE.get(PART_CACHE_DATE) == today and isinstance(STATE.get(PART_CACHE_KEY), dict):
-        # keys in JSON can become strings anyway; keep as str
         return {str(k): str(v) for k, v in STATE[PART_CACHE_KEY].items()}
 
     data = oddspapi_get("/v4/participants", {"sportId": 10, "language": "en"})
-    # data is dict { "3409": "Chicago Bulls", ... } per docs
     pm = {str(k): str(v) for k, v in (data or {}).items()}
     STATE[PART_CACHE_KEY] = pm
     STATE[PART_CACHE_DATE] = today
     save_state(STATE)
     return pm
 
-# ---- tournaments resolve (Oddspapi) ----
+# ---- tournaments cache ----
 TOURN_CACHE_KEY = "oddspapi_tournaments_10"
 TOURN_CACHE_DATE = "oddspapi_tournaments_10_date"
 
@@ -445,21 +463,20 @@ def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[s
                 "tournamentIds": ids,
                 "bookmaker": ODDSPAPI_BOOKMAKER,
                 "oddsFormat": "decimal",
-                "verbosity": 2,  # не обязателен, но часто помогает
+                "verbosity": 2,
             },
         )
         if isinstance(part, list):
             all_items.extend(part)
 
+        # маленькая пауза, чтобы реже ловить 429
+        time.sleep(0.06)
+
     return all_items
 
 def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """
-    Пытаемся вытащить OU 2.5 и BTTS из bookmakerOutcomeId.
-    В OddsPapi bookmakerOutcomeId может быть разным у разных букмекеров,
-    поэтому есть /odds_debug чтобы увидеть реальные строки.
-    """
     out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
+
     bm = ((item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
     markets = bm.get("markets") or {}
 
@@ -476,7 +493,7 @@ def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Option
             except:
                 continue
 
-            # OU 2.5 (самые частые варианты)
+            # OU 2.5
             if ("2.5/over" in outcome_id) or ("over/2.5" in outcome_id):
                 if OU_MIN <= price <= OU_MAX:
                     out["O25"] = price
@@ -484,7 +501,7 @@ def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Option
                 if OU_MIN <= price <= OU_MAX:
                     out["U25"] = price
 
-            # BTTS (варианты)
+            # BTTS
             if outcome_id in ("btts/yes", "btts_yes", "both_teams_to_score/yes", "yes"):
                 if BTTS_MIN <= price <= BTTS_MAX:
                     out["BTTS_Y"] = price
@@ -494,11 +511,24 @@ def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Option
 
     return out
 
+# ---- Odds cache (60 seconds) ----
+ODDS_CACHE_KEY = "odds_cache"
+ODDS_CACHE_TS = "odds_cache_ts"
+ODDS_CACHE_DATE = "odds_cache_date"
+
 def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
-    """
-    Возвращает map: (date, home_key, away_key) -> oddspapi_item
-    Имена команд берём через participants map, потому что в odds-by-tournaments идут participantId, а не Name.
-    """
+    now_ts = time.time()
+    cached_date = STATE.get(ODDS_CACHE_DATE)
+    cached_ts = float(STATE.get(ODDS_CACHE_TS, 0) or 0)
+    cached = STATE.get(ODDS_CACHE_KEY)
+
+    if cached_date == date_msk and isinstance(cached, dict) and (now_ts - cached_ts) < 60:
+        out = {}
+        for k, v in cached.items():
+            d, h, a = k.split("|", 2)
+            out[(d, h, a)] = v
+        return out
+
     participants = get_participants_map(force=False)
     tourn_map = resolve_target_tournament_ids(force=False)
     tourn_ids = list(set(tourn_map.values()))
@@ -532,6 +562,15 @@ def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, st
         k2 = safe_team_key(t2)
         m[(d_msk, k1, k2)] = it
         m[(d_msk, k2, k1)] = it
+
+    compact = {}
+    for (d, h, a), v in m.items():
+        compact[f"{d}|{h}|{a}"] = v
+
+    STATE[ODDS_CACHE_KEY] = compact
+    STATE[ODDS_CACHE_DATE] = date_msk
+    STATE[ODDS_CACHE_TS] = time.time()
+    save_state(STATE)
 
     return m
 
@@ -755,7 +794,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         home = (f.get("teams") or {}).get("home", {}) or {}
         away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
-        venue = fixture.get("venue", {}) or {}
+        venue = fixture.get("venue") or {}
         city = venue.get("city")
 
         home_id = home.get("id")
