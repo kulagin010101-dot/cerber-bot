@@ -116,7 +116,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # ======================
-# GOALS MODEL (простая модель; без “заглушек”)
+# GOALS MODEL (простая, но реальная)
 # ======================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -181,7 +181,6 @@ def prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> floa
     return clamp(p, 0.05, 0.90)
 
 def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
-    # мягко основано на btts обеих команд + небольшой вклад среднего тотала
     p = 0.50
     p += 0.25 * (hs["btts"] - 0.5)
     p += 0.25 * (as_["btts"] - 0.5)
@@ -190,10 +189,14 @@ def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> fl
     return clamp(p, 0.05, 0.90)
 
 # ======================
-# ODDS: авто-скан по значениям (НЕ по названию рынка)
+# ODDS (STRICT): только правильные рынки
 # ======================
 def norm(s: Any) -> str:
     return str(s or "").strip().lower()
+
+# для OU/BTTS отсечём мусорные “космические” коэффициенты
+OU_MAX_ODDS = float(os.getenv("OU_MAX_ODDS", "10.0"))      # для ТБ/ТМ 2.5
+BTTS_MAX_ODDS = float(os.getenv("BTTS_MAX_ODDS", "15.0"))  # для ОЗ
 
 def fetch_fixture_odds(fixture_id: int) -> list:
     try:
@@ -210,15 +213,52 @@ def fetch_fixture_odds(fixture_id: int) -> list:
         print(f"[ERROR] fetch_fixture_odds fixture={fixture_id}: {e}")
         return []
 
-def extract_best_odds_autoscan(odds_response: list) -> Dict[str, Optional[float]]:
+def is_ou_market(bet_name: str) -> bool:
     """
-    Возвращает лучший коэф среди ВСЕХ букмекеров на:
-    - O25 (Over 2.5)
-    - U25 (Under 2.5)
-    - BTTS_Y (Both teams to score: Yes)
-    - BTTS_N (Both teams to score: No)
+    Признаки рынка тоталов.
+    """
+    bn = norm(bet_name)
+    keys = [
+        "over/under",
+        "over under",
+        "total goals",
+        "totals",
+        "goals over/under",
+        "goals - over/under",
+        "match goals",
+    ]
+    return any(k in bn for k in keys)
 
-    Ищем по value-строкам (самое надежное), а не по name рынка.
+def is_btts_market(bet_name: str) -> bool:
+    bn = norm(bet_name)
+    keys = [
+        "both teams to score",
+        "btts",
+        "both teams score",
+    ]
+    return any(k in bn for k in keys)
+
+def label_is_over25(label: str) -> bool:
+    lb = norm(label).replace(",", ".")
+    return ("over" in lb or lb.startswith("o")) and "2.5" in lb
+
+def label_is_under25(label: str) -> bool:
+    lb = norm(label).replace(",", ".")
+    return ("under" in lb or lb.startswith("u")) and "2.5" in lb
+
+def label_is_yes(label: str) -> bool:
+    lb = norm(label)
+    return lb in ["yes", "y", "да"]
+
+def label_is_no(label: str) -> bool:
+    lb = norm(label)
+    return lb in ["no", "n", "нет"]
+
+def extract_best_odds_strict(odds_response: list) -> Dict[str, Optional[float]]:
+    """
+    Возвращает лучший коэф среди всех букмекеров, но ТОЛЬКО в правильных рынках:
+    - O25 / U25 из OU рынков
+    - BTTS_Y / BTTS_N из BTTS рынков
     """
     best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
     if not odds_response:
@@ -227,52 +267,48 @@ def extract_best_odds_autoscan(odds_response: list) -> Dict[str, Optional[float]
     for item in odds_response:
         for bm in (item.get("bookmakers") or []):
             for bet in (bm.get("bets") or []):
-                bet_name = norm(bet.get("name"))
-                for v in (bet.get("values") or []):
-                    label = norm(v.get("value"))
-                    odd_raw = v.get("odd")
+                bet_name = bet.get("name") or ""
+                bn = norm(bet_name)
+                values = bet.get("values") or []
 
-                    try:
-                        odd = float(odd_raw)
-                    except:
-                        continue
+                # ---- Over/Under 2.5 ----
+                if is_ou_market(bn):
+                    for v in values:
+                        label = v.get("value")
+                        odd_raw = v.get("odd")
+                        try:
+                            odd = float(odd_raw)
+                        except:
+                            continue
 
-                    # --- Over/Under 2.5 ---
-                    # варианты label:
-                    # "Over 2.5", "Under 2.5", "O 2.5", "U 2.5", "Over2.5", "Under2.5"
-                    if "2.5" in label and ("over" in label or label.startswith("o")):
-                        if best["O25"] is None or odd > best["O25"]:
-                            best["O25"] = odd
-                    if "2.5" in label and ("under" in label or label.startswith("u")):
-                        if best["U25"] is None or odd > best["U25"]:
-                            best["U25"] = odd
+                        # фильтр “мусора”
+                        if odd <= 1.01 or odd > OU_MAX_ODDS:
+                            continue
 
-                    # иногда 2.5 может быть в другом формате "2,5"
-                    if "2,5" in label and ("over" in label or label.startswith("o")):
-                        if best["O25"] is None or odd > best["O25"]:
-                            best["O25"] = odd
-                    if "2,5" in label and ("under" in label or label.startswith("u")):
-                        if best["U25"] is None or odd > best["U25"]:
-                            best["U25"] = odd
+                        if label_is_over25(label):
+                            if best["O25"] is None or odd > best["O25"]:
+                                best["O25"] = odd
+                        elif label_is_under25(label):
+                            if best["U25"] is None or odd > best["U25"]:
+                                best["U25"] = odd
 
-                    # --- BTTS Yes/No ---
-                    # обычно bet_name содержит "both teams to score" / "btts"
-                    # а label = "Yes"/"No"
-                    if ("both teams to score" in bet_name) or ("btts" in bet_name):
-                        if label in ["yes", "y", "да"]:
+                # ---- BTTS ----
+                if is_btts_market(bn):
+                    for v in values:
+                        label = v.get("value")
+                        odd_raw = v.get("odd")
+                        try:
+                            odd = float(odd_raw)
+                        except:
+                            continue
+
+                        if odd <= 1.01 or odd > BTTS_MAX_ODDS:
+                            continue
+
+                        if label_is_yes(label):
                             if best["BTTS_Y"] is None or odd > best["BTTS_Y"]:
                                 best["BTTS_Y"] = odd
-                        if label in ["no", "n", "нет"]:
-                            if best["BTTS_N"] is None or odd > best["BTTS_N"]:
-                                best["BTTS_N"] = odd
-
-                    # на некоторых книгах BTTS может называться просто "Yes"/"No" в другом рынке
-                    # поэтому делаем запасной вариант: если label yes/no и bet_name содержит "score"
-                    if ("score" in bet_name) and (label in ["yes", "no"]):
-                        if label == "yes":
-                            if best["BTTS_Y"] is None or odd > best["BTTS_Y"]:
-                                best["BTTS_Y"] = odd
-                        if label == "no":
+                        elif label_is_no(label):
                             if best["BTTS_N"] is None or odd > best["BTTS_N"]:
                                 best["BTTS_N"] = odd
 
@@ -282,7 +318,6 @@ def fair_odds(p: float) -> float:
     return round(1.0 / max(p, 1e-9), 2)
 
 def value_ev(p: float, book_odds: float) -> float:
-    # EV = p*odds - 1
     return (p * book_odds) - 1.0
 
 # ======================
@@ -437,10 +472,11 @@ def chunked(text: str, limit: int = 3500) -> List[str]:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — odds включены (авто-скан рынка, лучший коэф).\n\n"
+        "🐺 ЦЕРБЕР — odds исправлены (строгий парсинг рынков).\n\n"
         "Команды:\n"
         "• /signals — матчи + P + best odds + fair + value\n"
-        "• /reload_leagues — пересканировать турниры\n"
+        "• /reload_leagues — пересканировать турниры\n\n"
+        f"Фильтр “космических” odds: OU<= {OU_MAX_ODDS}, BTTS<= {BTTS_MAX_ODDS}\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,7 +515,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
-    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nРынки: ТБ2.5 / ТМ2.5 / ОЗ(Да/Нет)\nOdds: лучший коэф среди букмекеров\n\n"]
+    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nРынки: ТБ2.5 / ТМ2.5 / ОЗ(Да/Нет)\nOdds: лучший коэф среди букмекеров (строго по рынкам)\n\n"]
     count = 0
 
     for f in fixtures:
@@ -508,6 +544,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         p_o25 = prob_over25(hs, as_, w_k)
         p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
+
         p_btts_y = prob_btts_yes(hs, as_, w_k)
         p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
 
@@ -517,11 +554,10 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
-        # Odds autoscan
         odds_best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
         if fixture_id:
             odds_resp = fetch_fixture_odds(int(fixture_id))
-            odds_best = extract_best_odds_autoscan(odds_resp)
+            odds_best = extract_best_odds_strict(odds_resp)
 
         def fmt_market(title: str, p: float, book: Optional[float]) -> str:
             fo = fair_odds(p)
