@@ -14,16 +14,14 @@ API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
-if not CHAT_ID:
-    raise ValueError("TELEGRAM_CHAT_ID не задан в переменных окружения!")
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("BOT_TOKEN или TELEGRAM_CHAT_ID не задан!")
 
 MIN_PROB = 0.75
 SEASON = 2025
 HEADERS = {"x-apisports-key": API_KEY}
 REF_FILE = "referees.json"
-TEAM_IDS = [39, 140, 135, 78, 235]
+TEAM_IDS = [39, 140, 135, 78, 235]  # Англия, Испания, Италия, Германия, Россия
 
 # ======================
 # СУДЬИ
@@ -70,10 +68,8 @@ def update_referees():
                 referee = f["fixture"]["referee"]
                 if not referee:
                     continue
-
                 if referee not in REFEREES:
                     REFEREES[referee] = {"penalties_per_game": 0, "avg_goals": 0, "count": 0}
-
                 pen = REFEREES[referee]["penalties_per_game"] * REFEREES[referee]["count"]
                 goals = REFEREES[referee]["avg_goals"] * REFEREES[referee]["count"]
                 count = REFEREES[referee]["count"]
@@ -100,7 +96,6 @@ def update_referees():
 
         for r in REFEREES:
             REFEREES[r].pop("count", None)
-
         save_referees()
         print(f"[{datetime.now()}] База судей обновлена. Всего судей: {len(REFEREES)}")
     except Exception as e:
@@ -208,7 +203,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Сегодня матчей не найдено в API.")
             return
 
-        msg = "⚽ ПРОВЕРКА СИГНАЛОВ ЦЕРБЕРА (ВСЕ МАТЧИ)\n\n"
+        msg = "⚽ СИГНАЛЫ ЦЕРБЕРА (ВСЕ МАТЧИ)\n\n"
         for f in fixtures:
             home = f["teams"]["home"]
             away = f["teams"]["away"]
@@ -255,17 +250,16 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
 # ======================
 async def main():
     try:
-        async with ApplicationBuilder().token(BOT_TOKEN).build() as app:
-
-            # Команды
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("signals", signals))
-
-            # JobQueue
+        # post_init используется для безопасного добавления job_queue
+        async def setup(app):
             app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
+            print("JobQueue настроен")
 
-            # Запуск бота
-            await app.run_polling()
+        app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("signals", signals))
+
+        await app.run_polling()
     except Exception as e:
         print(f"[ERROR] main: {e}")
 
