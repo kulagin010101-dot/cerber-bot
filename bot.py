@@ -186,9 +186,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команда: /signals"
     )
 
-# ======================
-# ОТЛАДКА СИГНАЛОВ
-# ======================
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures = get_today_matches()
     if not fixtures:
@@ -235,19 +232,18 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
 # ЗАПУСК
 # ======================
 async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Используем асинхронный контекст, job_queue гарантированно создаётся
+    async with ApplicationBuilder().token(BOT_TOKEN).build() as app:
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signals", signals))
+        # Команды
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("signals", signals))
 
-    # Асинхронная инициализация (job_queue будет создан)
-    await app.initialize()
+        # JobQueue
+        app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
 
-    # Ежедневное обновление судей в 03:00 UTC
-    app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
-
-    # Запуск бота
-    await app.run_polling()
+        # Запуск бота
+        await app.run_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
