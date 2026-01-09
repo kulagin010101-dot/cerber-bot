@@ -23,9 +23,20 @@ if not API_KEY:
 HEADERS = {"x-apisports-key": API_KEY}
 
 SEASON = int(os.getenv("SEASON", "2025"))
+
+# Порог вероятности для сигналов (например 0.75 = 75%)
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 
+# Порог value (EV). Можно поставить 0.03 или 0.05, чтобы отсечь шум
+MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))
+
 STATE_FILE = "state.json"
+
+# фильтры “аномальных” odds (защита от мусора/не тех рынков)
+OU_MAX_ODDS = float(os.getenv("OU_MAX_ODDS", "10.0"))      # для тоталов
+BTTS_MAX_ODDS = float(os.getenv("BTTS_MAX_ODDS", "15.0"))  # для ОЗ
+
+PINNACLE_NAME = "pinnacle"
 
 # ======================
 # TARGET COMPETITIONS + ALIASES
@@ -84,6 +95,15 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # ======================
+# HELPERS
+# ======================
+def norm(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+def clamp(x: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    return min(max(x, lo), hi)
+
+# ======================
 # WEATHER
 # ======================
 def weather_factor(city: Optional[str]) -> float:
@@ -116,7 +136,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # ======================
-# GOALS MODEL (простая, но реальная)
+# MODEL: goals (last 5)
 # ======================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -161,9 +181,6 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
         "over25": over25 / n
     }
 
-def clamp(x: float, lo: float = 0.01, hi: float = 0.99) -> float:
-    return min(max(x, lo), hi)
-
 def prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
     p = 0.60
     base = (hs["avg"] + as_["avg"]) / 2.0
@@ -188,16 +205,15 @@ def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> fl
     p *= w_k
     return clamp(p, 0.05, 0.90)
 
-# ======================
-# ODDS (STRICT): только правильные рынки
-# ======================
-def norm(s: Any) -> str:
-    return str(s or "").strip().lower()
+def fair_odds(p: float) -> float:
+    return round(1.0 / max(p, 1e-9), 2)
 
-# для OU/BTTS отсечём мусорные “космические” коэффициенты
-OU_MAX_ODDS = float(os.getenv("OU_MAX_ODDS", "10.0"))      # для ТБ/ТМ 2.5
-BTTS_MAX_ODDS = float(os.getenv("BTTS_MAX_ODDS", "15.0"))  # для ОЗ
+def value_ev(p: float, book_odds: float) -> float:
+    return (p * book_odds) - 1.0
 
+# ======================
+# ODDS: Pinnacle only
+# ======================
 def fetch_fixture_odds(fixture_id: int) -> list:
     try:
         r = requests.get(
@@ -214,28 +230,13 @@ def fetch_fixture_odds(fixture_id: int) -> list:
         return []
 
 def is_ou_market(bet_name: str) -> bool:
-    """
-    Признаки рынка тоталов.
-    """
     bn = norm(bet_name)
-    keys = [
-        "over/under",
-        "over under",
-        "total goals",
-        "totals",
-        "goals over/under",
-        "goals - over/under",
-        "match goals",
-    ]
+    keys = ["over/under", "over under", "total goals", "totals", "goals over/under", "match goals"]
     return any(k in bn for k in keys)
 
 def is_btts_market(bet_name: str) -> bool:
     bn = norm(bet_name)
-    keys = [
-        "both teams to score",
-        "btts",
-        "both teams score",
-    ]
+    keys = ["both teams to score", "btts", "both teams score"]
     return any(k in bn for k in keys)
 
 def label_is_over25(label: str) -> bool:
@@ -254,74 +255,63 @@ def label_is_no(label: str) -> bool:
     lb = norm(label)
     return lb in ["no", "n", "нет"]
 
-def extract_best_odds_strict(odds_response: list) -> Dict[str, Optional[float]]:
+def extract_pinnacle_odds(odds_response: list) -> Dict[str, Optional[float]]:
     """
-    Возвращает лучший коэф среди всех букмекеров, но ТОЛЬКО в правильных рынках:
-    - O25 / U25 из OU рынков
-    - BTTS_Y / BTTS_N из BTTS рынков
+    Берём только букмекера Pinnacle.
+    Возвращает odds на:
+    - O25, U25 (из OU рынков)
+    - BTTS_Y, BTTS_N (из BTTS рынков)
     """
-    best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
+    out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
     if not odds_response:
-        return best
+        return out
 
     for item in odds_response:
         for bm in (item.get("bookmakers") or []):
+            if norm(bm.get("name")) != PINNACLE_NAME:
+                continue
+
             for bet in (bm.get("bets") or []):
                 bet_name = bet.get("name") or ""
-                bn = norm(bet_name)
                 values = bet.get("values") or []
 
-                # ---- Over/Under 2.5 ----
-                if is_ou_market(bn):
+                # Totals
+                if is_ou_market(bet_name):
                     for v in values:
                         label = v.get("value")
-                        odd_raw = v.get("odd")
                         try:
-                            odd = float(odd_raw)
+                            odd = float(v.get("odd"))
                         except:
                             continue
-
-                        # фильтр “мусора”
                         if odd <= 1.01 or odd > OU_MAX_ODDS:
                             continue
-
                         if label_is_over25(label):
-                            if best["O25"] is None or odd > best["O25"]:
-                                best["O25"] = odd
+                            out["O25"] = odd
                         elif label_is_under25(label):
-                            if best["U25"] is None or odd > best["U25"]:
-                                best["U25"] = odd
+                            out["U25"] = odd
 
-                # ---- BTTS ----
-                if is_btts_market(bn):
+                # BTTS
+                if is_btts_market(bet_name):
                     for v in values:
                         label = v.get("value")
-                        odd_raw = v.get("odd")
                         try:
-                            odd = float(odd_raw)
+                            odd = float(v.get("odd"))
                         except:
                             continue
-
                         if odd <= 1.01 or odd > BTTS_MAX_ODDS:
                             continue
-
                         if label_is_yes(label):
-                            if best["BTTS_Y"] is None or odd > best["BTTS_Y"]:
-                                best["BTTS_Y"] = odd
+                            out["BTTS_Y"] = odd
                         elif label_is_no(label):
-                            if best["BTTS_N"] is None or odd > best["BTTS_N"]:
-                                best["BTTS_N"] = odd
+                            out["BTTS_N"] = odd
 
-    return best
+            # нашли Pinnacle — дальше не ищем
+            return out
 
-def fair_odds(p: float) -> float:
-    return round(1.0 / max(p, 1e-9), 2)
-
-def value_ev(p: float, book_odds: float) -> float:
-    return (p * book_odds) - 1.0
+    return out
 
 # ======================
-# LEAGUES LOOKUP (SMART)
+# LEAGUES (smart resolve + cache)
 # ======================
 def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": search_text}
@@ -472,11 +462,13 @@ def chunked(text: str, limit: int = 3500) -> List[str]:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — odds исправлены (строгий парсинг рынков).\n\n"
+        "🐺 ЦЕРБЕР — Pinnacle mode включён.\n"
+        "Odds берём ТОЛЬКО у Pinnacle из API-Football.\n\n"
         "Команды:\n"
-        "• /signals — матчи + P + best odds + fair + value\n"
+        "• /signals — value-сигналы (P>=порог, Value>0, есть Pinnacle odds)\n"
         "• /reload_leagues — пересканировать турниры\n\n"
-        f"Фильтр “космических” odds: OU<= {OU_MAX_ODDS}, BTTS<= {BTTS_MAX_ODDS}\n"
+        f"Порог P: {int(MIN_PROB*100)}%\n"
+        f"Порог Value: {MIN_VALUE:+.2f}\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -515,8 +507,9 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
-    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nРынки: ТБ2.5 / ТМ2.5 / ОЗ(Да/Нет)\nOdds: лучший коэф среди букмекеров (строго по рынкам)\n\n"]
+    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nИсточник odds: Pinnacle\n\n"]
     count = 0
+    found_any = 0
 
     for f in fixtures:
         fixture = f.get("fixture") or {}
@@ -532,7 +525,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         home_id = home.get("id")
         away_id = away.get("id")
-        if not home_id or not away_id:
+        if not home_id or not away_id or not fixture_id:
             continue
 
         hs = analyze_goals(get_last_matches(int(home_id), last=5))
@@ -554,32 +547,57 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
-        odds_best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
-        if fixture_id:
-            odds_resp = fetch_fixture_odds(int(fixture_id))
-            odds_best = extract_best_odds_strict(odds_resp)
+        odds_resp = fetch_fixture_odds(int(fixture_id))
+        odds_pin = extract_pinnacle_odds(odds_resp)
 
-        def fmt_market(title: str, p: float, book: Optional[float]) -> str:
-            fo = fair_odds(p)
-            if book:
-                v = value_ev(p, book)
-                return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fo:.2f} | Value={v:+.2f}"
-            return f"{title}: P={int(p*100)}% | Book=нет линии | Fair={fo:.2f}"
+        def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
+            if book is None:
+                return None
+            if p < MIN_PROB:
+                return None
+            v = value_ev(p, book)
+            if v <= MIN_VALUE:
+                return None
+            return f"{title}: P={int(p*100)}% | Book(Pinnacle)={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
 
+        lines = []
+        for title, p, book in [
+            ("ТБ 2.5", p_o25, odds_pin["O25"]),
+            ("ТМ 2.5", p_u25, odds_pin["U25"]),
+            ("ОЗ Да", p_btts_y, odds_pin["BTTS_Y"]),
+            ("ОЗ Нет", p_btts_n, odds_pin["BTTS_N"]),
+        ]:
+            ml = market_line(title, p, book)
+            if ml:
+                lines.append(ml)
+
+        if not lines:
+            continue
+
+        found_any += 1
         out.append(
             f"🏆 {league_name}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
-            f"🕒 {t_str}\n"
-            f"{fmt_market('ТБ 2.5', p_o25, odds_best['O25'])}\n"
-            f"{fmt_market('ТМ 2.5', p_u25, odds_best['U25'])}\n"
-            f"{fmt_market('ОЗ Да', p_btts_y, odds_best['BTTS_Y'])}\n"
-            f"{fmt_market('ОЗ Нет', p_btts_n, odds_best['BTTS_N'])}\n\n"
+            f"🕒 {t_str}\n" +
+            "\n".join(lines) +
+            "\n\n"
         )
 
         count += 1
         if count % 6 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(out))
             out = ["(продолжение)\n\n"]
+
+    if found_any == 0:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"📭 На дату {used_date} нет value-сигналов по Pinnacle при порогах:\n"
+                f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n"
+                "Это нормально: лучше пусто, чем мусор."
+            )
+        )
+        return
 
     if out:
         await context.bot.send_message(chat_id=chat_id, text="".join(out))
