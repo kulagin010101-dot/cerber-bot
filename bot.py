@@ -27,12 +27,8 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 
 STATE_FILE = "state.json"
 
-# Название рынка в API-Football для O/U 2.5 — иногда может отличаться.
-# Оставляю дефолт, но если надо — можно переопределить переменной окружения.
-ODDS_MARKET_OVER25 = os.getenv("ODDS_MARKET_OVER25", "Over/Under 2.5")
-
 # ======================
-# TARGET COMPETITIONS + ALIASES (умный поиск)
+# TARGET COMPETITIONS + ALIASES
 # ======================
 TARGET_COMPETITIONS: List[Dict[str, Any]] = [
     # England
@@ -120,7 +116,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # ======================
-# GOALS MODEL
+# GOALS MODEL (простая модель; без “заглушек”)
 # ======================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -165,25 +161,40 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
         "over25": over25 / n
     }
 
-def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
-    prob = 0.60
+def clamp(x: float, lo: float = 0.01, hi: float = 0.99) -> float:
+    return min(max(x, lo), hi)
+
+def prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
+    p = 0.60
     base = (hs["avg"] + as_["avg"]) / 2.0
 
     if base >= 2.6:
-        prob += 0.08
+        p += 0.08
     if hs["over25"] >= 0.6:
-        prob += 0.05
+        p += 0.05
     if as_["over25"] >= 0.6:
-        prob += 0.05
+        p += 0.05
     if hs["btts"] >= 0.6 and as_["btts"] >= 0.6:
-        prob += 0.04
+        p += 0.04
 
-    prob *= w_k
-    return min(max(prob, 0.05), 0.90)
+    p *= w_k
+    return clamp(p, 0.05, 0.90)
+
+def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
+    # мягко основано на btts обеих команд + небольшой вклад среднего тотала
+    p = 0.50
+    p += 0.25 * (hs["btts"] - 0.5)
+    p += 0.25 * (as_["btts"] - 0.5)
+    p += 0.05 * (((hs["avg"] + as_["avg"]) / 2.0) - 2.4)
+    p *= w_k
+    return clamp(p, 0.05, 0.90)
 
 # ======================
-# ODDS (BEST COEF)
+# ODDS: авто-скан по значениям (НЕ по названию рынка)
 # ======================
+def norm(s: Any) -> str:
+    return str(s or "").strip().lower()
+
 def fetch_fixture_odds(fixture_id: int) -> list:
     try:
         r = requests.get(
@@ -194,44 +205,85 @@ def fetch_fixture_odds(fixture_id: int) -> list:
         )
         r.raise_for_status()
         data = r.json()
-        if data.get("errors"):
-            print("[API odds errors]", data["errors"])
         return data.get("response", []) or []
     except Exception as e:
         print(f"[ERROR] fetch_fixture_odds fixture={fixture_id}: {e}")
         return []
 
-def extract_best_over25_odds(odds_response: list) -> Optional[float]:
+def extract_best_odds_autoscan(odds_response: list) -> Dict[str, Optional[float]]:
     """
-    Лучший (максимальный) коэффициент на Over 2.5 среди всех букмекеров.
-    """
-    if not odds_response:
-        return None
+    Возвращает лучший коэф среди ВСЕХ букмекеров на:
+    - O25 (Over 2.5)
+    - U25 (Under 2.5)
+    - BTTS_Y (Both teams to score: Yes)
+    - BTTS_N (Both teams to score: No)
 
-    best = None
-    market_name = ODDS_MARKET_OVER25.strip().lower()
+    Ищем по value-строкам (самое надежное), а не по name рынка.
+    """
+    best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
+    if not odds_response:
+        return best
 
     for item in odds_response:
         for bm in (item.get("bookmakers") or []):
-            for b in (bm.get("bets") or []):
-                bet_name = (b.get("name") or "").strip().lower()
-                if bet_name != market_name:
-                    continue
+            for bet in (bm.get("bets") or []):
+                bet_name = norm(bet.get("name"))
+                for v in (bet.get("values") or []):
+                    label = norm(v.get("value"))
+                    odd_raw = v.get("odd")
 
-                for v in (b.get("values") or []):
-                    label = (v.get("value") or "").strip().lower()
-                    odd_str = v.get("odd")
                     try:
-                        odd = float(odd_str)
+                        odd = float(odd_raw)
                     except:
                         continue
 
-                    # варианты подписей
-                    if label in ["over 2.5", "over2.5", "o2.5", "over"]:
-                        if best is None or odd > best:
-                            best = odd
+                    # --- Over/Under 2.5 ---
+                    # варианты label:
+                    # "Over 2.5", "Under 2.5", "O 2.5", "U 2.5", "Over2.5", "Under2.5"
+                    if "2.5" in label and ("over" in label or label.startswith("o")):
+                        if best["O25"] is None or odd > best["O25"]:
+                            best["O25"] = odd
+                    if "2.5" in label and ("under" in label or label.startswith("u")):
+                        if best["U25"] is None or odd > best["U25"]:
+                            best["U25"] = odd
+
+                    # иногда 2.5 может быть в другом формате "2,5"
+                    if "2,5" in label and ("over" in label or label.startswith("o")):
+                        if best["O25"] is None or odd > best["O25"]:
+                            best["O25"] = odd
+                    if "2,5" in label and ("under" in label or label.startswith("u")):
+                        if best["U25"] is None or odd > best["U25"]:
+                            best["U25"] = odd
+
+                    # --- BTTS Yes/No ---
+                    # обычно bet_name содержит "both teams to score" / "btts"
+                    # а label = "Yes"/"No"
+                    if ("both teams to score" in bet_name) or ("btts" in bet_name):
+                        if label in ["yes", "y", "да"]:
+                            if best["BTTS_Y"] is None or odd > best["BTTS_Y"]:
+                                best["BTTS_Y"] = odd
+                        if label in ["no", "n", "нет"]:
+                            if best["BTTS_N"] is None or odd > best["BTTS_N"]:
+                                best["BTTS_N"] = odd
+
+                    # на некоторых книгах BTTS может называться просто "Yes"/"No" в другом рынке
+                    # поэтому делаем запасной вариант: если label yes/no и bet_name содержит "score"
+                    if ("score" in bet_name) and (label in ["yes", "no"]):
+                        if label == "yes":
+                            if best["BTTS_Y"] is None or odd > best["BTTS_Y"]:
+                                best["BTTS_Y"] = odd
+                        if label == "no":
+                            if best["BTTS_N"] is None or odd > best["BTTS_N"]:
+                                best["BTTS_N"] = odd
 
     return best
+
+def fair_odds(p: float) -> float:
+    return round(1.0 / max(p, 1e-9), 2)
+
+def value_ev(p: float, book_odds: float) -> float:
+    # EV = p*odds - 1
+    return (p * book_odds) - 1.0
 
 # ======================
 # LEAGUES LOOKUP (SMART)
@@ -292,14 +344,12 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
 
         best_id = None
         best_score = -999999
-        best_debug = None
 
         for alias in aliases:
             for ctry in [country, None]:
                 try:
                     results = leagues_search(alias, ctry)
-                except Exception as e:
-                    print(f"[ERROR] leagues_search {key} alias={alias} country={ctry}: {e}")
+                except:
                     results = []
 
                 for rr in results:
@@ -314,14 +364,11 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
                     if sc > best_score:
                         best_score = sc
                         best_id = lg.get("id")
-                        best_debug = f"{cand_country}|{cand_name} id={best_id} score={sc}"
 
         if best_id:
             resolved[key] = int(best_id)
-            print(f"[INFO] League resolved {key} -> {best_debug}")
         else:
             missing.append(key)
-            print(f"[WARN] League NOT found: {key}")
 
     STATE["league_ids"] = {k: int(v) for k, v in resolved.items()}
     STATE["league_missing"] = missing
@@ -390,11 +437,10 @@ def chunked(text: str, limit: int = 3500) -> List[str]:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — odds включены (беру ЛУЧШИЙ коэф среди букмекеров).\n\n"
+        "🐺 ЦЕРБЕР — odds включены (авто-скан рынка, лучший коэф).\n\n"
         "Команды:\n"
-        "• /signals — матчи по выбранным турнирам + вероятность + лучший коэф + value\n"
+        "• /signals — матчи + P + best odds + fair + value\n"
         "• /reload_leagues — пересканировать турниры\n"
-        "• /debug_league <страна|UEFA> <поиск>\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,53 +466,6 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in chunked(text):
         await context.bot.send_message(chat_id=chat_id, text=part)
 
-async def debug_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = target_chat_id(update)
-    args = context.args
-    if len(args) < 2:
-        await context.bot.send_message(chat_id=chat_id, text="Используй: /debug_league <страна|UEFA> <поиск>")
-        return
-
-    c = args[0]
-    q = " ".join(args[1:]).strip()
-    country = None if c.strip().upper() == "UEFA" else c.strip()
-
-    try:
-        res1 = leagues_search(q, country)
-        res2 = [] if country is None else leagues_search(q, None)
-        combined = res1 + res2
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"Ошибка поиска лиг: {e}")
-        return
-
-    if not combined:
-        await context.bot.send_message(chat_id=chat_id, text="Ничего не найдено.")
-        return
-
-    lines = [f"🔎 Результаты API для: country={country} search='{q}' (первые 10)\n\n"]
-    shown = 0
-    seen = set()
-    for rr in combined:
-        lg = rr.get("league", {}) or {}
-        cn = rr.get("country", {}) or {}
-        lid = lg.get("id")
-        nm = (lg.get("name") or "").strip()
-        cc = (cn.get("name") or "").strip()
-        if not lid or not nm:
-            continue
-        key = (lid, nm, cc)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        lines.append(f"• {cc}|{nm} → ID {lid}\n")
-        shown += 1
-        if shown >= 10:
-            break
-
-    for part in chunked("".join(lines)):
-        await context.bot.send_message(chat_id=chat_id, text=part)
-
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
 
@@ -480,17 +479,19 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
-    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nOdds: лучший коэф на ТБ2.5\n\n"]
+    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nРынки: ТБ2.5 / ТМ2.5 / ОЗ(Да/Нет)\nOdds: лучший коэф среди букмекеров\n\n"]
     count = 0
 
     for f in fixtures:
-        fixture_id = (f.get("fixture") or {}).get("id")
+        fixture = f.get("fixture") or {}
+        fixture_id = fixture.get("id")
+
         home = (f.get("teams") or {}).get("home", {}) or {}
         away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
         league_name = league.get("name", "?")
 
-        venue = (f.get("fixture") or {}).get("venue", {}) or {}
+        venue = fixture.get("venue", {}) or {}
         city = venue.get("city")
 
         home_id = home.get("id")
@@ -503,38 +504,44 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not hs or not as_:
             continue
 
-        prob = calc_prob_over25(hs, as_, weather_factor(city))
+        w_k = weather_factor(city)
 
-        ts = (f.get("fixture") or {}).get("timestamp")
+        p_o25 = prob_over25(hs, as_, w_k)
+        p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
+        p_btts_y = prob_btts_yes(hs, as_, w_k)
+        p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
+
+        ts = fixture.get("timestamp")
         t_str = "—"
         if ts:
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
-        # ODDS
-        best_odds = None
+        # Odds autoscan
+        odds_best = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
         if fixture_id:
             odds_resp = fetch_fixture_odds(int(fixture_id))
-            best_odds = extract_best_over25_odds(odds_resp)
+            odds_best = extract_best_odds_autoscan(odds_resp)
 
-        fair = round(1.0 / prob, 2) if prob > 0 else None
-
-        if best_odds:
-            value = (prob * best_odds) - 1.0
-            odds_line = f"Book(best): {best_odds:.2f} | Fair: {fair:.2f} | Value: {value:+.2f}"
-        else:
-            odds_line = f"Book(best): нет линии | Fair: {fair:.2f}"
+        def fmt_market(title: str, p: float, book: Optional[float]) -> str:
+            fo = fair_odds(p)
+            if book:
+                v = value_ev(p, book)
+                return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fo:.2f} | Value={v:+.2f}"
+            return f"{title}: P={int(p*100)}% | Book=нет линии | Fair={fo:.2f}"
 
         out.append(
             f"🏆 {league_name}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
-            f"ТБ2.5: {int(prob*100)}%\n"
-            f"{odds_line}\n\n"
+            f"{fmt_market('ТБ 2.5', p_o25, odds_best['O25'])}\n"
+            f"{fmt_market('ТМ 2.5', p_u25, odds_best['U25'])}\n"
+            f"{fmt_market('ОЗ Да', p_btts_y, odds_best['BTTS_Y'])}\n"
+            f"{fmt_market('ОЗ Нет', p_btts_n, odds_best['BTTS_N'])}\n\n"
         )
 
         count += 1
-        if count % 8 == 0:
+        if count % 6 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(out))
             out = ["(продолжение)\n\n"]
 
@@ -549,7 +556,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("reload_leagues", reload_leagues))
-    app.add_handler(CommandHandler("debug_league", debug_league))
     app.run_polling()
 
 if __name__ == "__main__":
