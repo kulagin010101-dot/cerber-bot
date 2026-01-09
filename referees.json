@@ -1,1 +1,22 @@
-{}
+{
+  "Michael Oliver": {
+    "penalties_per_game": 0.34,
+    "avg_goals": 2.9
+  },
+  "Anthony Taylor": {
+    "penalties_per_game": 0.28,
+    "avg_goals": 2.7
+  },
+  "Daniele Orsato": {
+    "penalties_per_game": 0.18,
+    "avg_goals": 2.4
+  },
+  "Clément Turpin": {
+    "penalties_per_game": 0.31,
+    "avg_goals": 2.8
+  },
+  "Sergey Karasev": {
+    "penalties_per_game": 0.22,
+    "avg_goals": 2.5
+  }
+}
