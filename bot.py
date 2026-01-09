@@ -250,19 +250,19 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
 # ======================
 async def main():
     try:
-        # post_init используется для безопасного добавления job_queue
         async def setup(app):
             app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
             print("JobQueue настроен")
 
-        app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup).build()
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("signals", signals))
+        async with ApplicationBuilder().token(BOT_TOKEN).post_init(setup).build() as app:
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("signals", signals))
 
-        await app.run_polling()
+            await app.run_polling()
     except Exception as e:
         print(f"[ERROR] main: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
