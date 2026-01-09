@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import unicodedata
 import requests
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List, Tuple
@@ -30,6 +31,7 @@ SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))   # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00")) # value > 0
 
+# sanity filters for odds
 OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.10")), float(os.getenv("OU_ODDS_MAX", "6.00"))
 BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.10")), float(os.getenv("BTTS_ODDS_MAX", "6.00"))
 
@@ -129,19 +131,35 @@ def norm(s: Any) -> str:
     return str(s or "").strip().lower()
 
 def safe_team_key(name: str) -> str:
-    s = norm(name)
+    """
+    Сильная нормализация для сматчинга:
+    - убираем диакритику: Atlético -> Atletico
+    - убираем FC/CF/SC/AC
+    - чистим пунктуацию
+    """
+    s = str(name or "").strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
     repl = {
         "&": "and",
-        "fc ": "",
-        " fc": "",
-        "cf ": "",
-        " cf": "",
+        "’": "'",
         ".": "",
         ",": "",
-        "’": "'",
+        "-": " ",
+        " fc": "",
+        "fc ": "",
+        " cf": "",
+        "cf ": "",
+        " sc": "",
+        "sc ": "",
+        " ac": "",
+        "ac ": "",
+        "  ": " ",
     }
     for a, b in repl.items():
         s = s.replace(a, b)
+
     s = " ".join(s.split())
     return s
 
@@ -376,15 +394,11 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
 # OddsPapi: GET with retry on 429
 # =====================================================
 def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
-    """
-    OddsPapi GET с обработкой rate-limit (429).
-    При 429 ждём retryMs и повторяем.
-    """
     params = dict(params)
     params["apiKey"] = ODDSPAPI_KEY
     url = f"https://api.oddspapi.io{path}"
 
-    for _attempt in range(6):
+    for _ in range(6):
         r = requests.get(url, params=params, timeout=30)
 
         if r.status_code == 429:
@@ -447,9 +461,6 @@ def resolve_target_tournament_ids(force: bool = False) -> Dict[str, int]:
     return out
 
 def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[str, Any]]:
-    """
-    IMPORTANT: Oddspapi ограничение: максимум 5 tournamentIds за запрос
-    """
     all_items: List[Dict[str, Any]] = []
     MAX_IDS = 5
 
@@ -469,16 +480,27 @@ def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[s
         if isinstance(part, list):
             all_items.extend(part)
 
-        # маленькая пауза, чтобы реже ловить 429
-        time.sleep(0.06)
+        time.sleep(0.08)  # микропаузa
 
     return all_items
 
 def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Расширенный парсер под 1xBet:
+    - OU 2.5: ловим '2.5'/'2_5' + over/under/ov/un
+    - BTTS: ловим btts/both/teams_to_score/gg + yes/no
+    """
     out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
-
     bm = ((item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
     markets = bm.get("markets") or {}
+
+    def set_if_ok(key: str, price: Any, lo: float, hi: float):
+        try:
+            p = float(price)
+        except:
+            return
+        if lo <= p <= hi:
+            out[key] = p
 
     for _mid, m in markets.items():
         outcomes = m.get("outcomes") or {}
@@ -486,32 +508,28 @@ def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Option
             players = o.get("players") or {}
             p0 = players.get("0") or players.get(0) or {}
             price = p0.get("price")
-            outcome_id = norm(p0.get("bookmakerOutcomeId"))
+            oid = norm(p0.get("bookmakerOutcomeId"))
 
-            try:
-                price = float(price)
-            except:
+            if not oid or price is None:
                 continue
 
-            # OU 2.5
-            if ("2.5/over" in outcome_id) or ("over/2.5" in outcome_id):
-                if OU_MIN <= price <= OU_MAX:
-                    out["O25"] = price
-            elif ("2.5/under" in outcome_id) or ("under/2.5" in outcome_id):
-                if OU_MIN <= price <= OU_MAX:
-                    out["U25"] = price
+            # ---- OU 2.5 ----
+            has_25 = ("2.5" in oid) or ("2_5" in oid) or ("25" in oid and "2" in oid and "5" in oid)
+            if has_25 and ("over" in oid or "_ov" in oid or " ov" in oid):
+                set_if_ok("O25", price, OU_MIN, OU_MAX)
+            if has_25 and ("under" in oid or "_un" in oid or " un" in oid):
+                set_if_ok("U25", price, OU_MIN, OU_MAX)
 
-            # BTTS
-            if outcome_id in ("btts/yes", "btts_yes", "both_teams_to_score/yes", "yes"):
-                if BTTS_MIN <= price <= BTTS_MAX:
-                    out["BTTS_Y"] = price
-            elif outcome_id in ("btts/no", "btts_no", "both_teams_to_score/no", "no"):
-                if BTTS_MIN <= price <= BTTS_MAX:
-                    out["BTTS_N"] = price
+            # ---- BTTS ----
+            if ("btts" in oid) or ("both" in oid) or ("teams_to_score" in oid) or ("gg" in oid):
+                if ("yes" in oid) or oid.endswith("_y") or oid.endswith("_yes"):
+                    set_if_ok("BTTS_Y", price, BTTS_MIN, BTTS_MAX)
+                if ("no" in oid) or oid.endswith("_n") or oid.endswith("_no"):
+                    set_if_ok("BTTS_N", price, BTTS_MIN, BTTS_MAX)
 
     return out
 
-# ---- Odds cache (60 seconds) ----
+# ---- Odds cache (60 sec) ----
 ODDS_CACHE_KEY = "odds_cache"
 ODDS_CACHE_TS = "odds_cache_ts"
 ODDS_CACHE_DATE = "odds_cache_date"
@@ -560,6 +578,7 @@ def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, st
 
         k1 = safe_team_key(t1)
         k2 = safe_team_key(t2)
+
         m[(d_msk, k1, k2)] = it
         m[(d_msk, k2, k1)] = it
 
@@ -575,18 +594,18 @@ def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, st
     return m
 
 # =====================================================
-# Telegram handlers
+# Telegram commands
 # =====================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
         "Команды:\n"
         "• /signals — value-сигналы (P≥75% и Value>0)\n"
-        "• /all — все матчи (с P и odds)\n"
-        "• /check — диагностика сматчинга odds\n"
-        "• /odds_debug — сырой вывод outcomeId/price\n"
+        "• /all — все матчи (P + odds)\n"
+        "• /check — диагностика odds\n"
+        "• /odds_debug — сырой outcomeId/price\n"
         "• /oddspapi_account — проверка ключа\n"
-        "• /reload_leagues — пересканировать лиги API-Football\n\n"
+        "• /reload_leagues — пересканировать лиги\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
     )
 
@@ -677,7 +696,7 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         f"🧪 ODDS DEBUG ({used_date})\n{home} — {away}\nBookmaker: {ODDSPAPI_BOOKMAKER}\n",
         f"fixtureId: {it.get('fixtureId')}\nstartTime: {it.get('startTime')}\nmarkets: {len(markets)}\n\n",
-        "RAW sample (до 50 строк):\n",
+        "RAW sample (до 60 строк):\n",
     ]
 
     shown = 0
@@ -692,9 +711,9 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             lines.append(f"m={mid} o={oid} outcome={bok} price={price}\n")
             shown += 1
-            if shown >= 50:
+            if shown >= 60:
                 break
-        if shown >= 50:
+        if shown >= 60:
             break
 
     for part in chunked("".join(lines)):
@@ -720,7 +739,7 @@ async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         home = (f.get("teams") or {}).get("home", {}) or {}
         away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
-        venue = fixture.get("venue", {}) or {}
+        venue = fixture.get("venue") or {}
         city = venue.get("city")
 
         home_id = home.get("id")
