@@ -11,31 +11,36 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # ENV
 # ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_KEY = os.getenv("FOOTBALL_API_KEY")
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
+ODDSPAPI_KEY = os.getenv("ODDSPAPI_KEY")  # <-- odds source (oddspapi.io)
+WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # optional
 DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан!")
-if not API_KEY:
+if not FOOTBALL_API_KEY:
     raise ValueError("FOOTBALL_API_KEY не задан!")
+if not ODDSPAPI_KEY:
+    raise ValueError("ODDSPAPI_KEY не задан! Добавь его в Railway Variables.")
 
-HEADERS = {"x-apisports-key": API_KEY}
+HEADERS_FOOTBALL = {"x-apisports-key": FOOTBALL_API_KEY}
 
 SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))
 
-OU_MAX_ODDS = float(os.getenv("OU_MAX_ODDS", "10.0"))
-BTTS_MAX_ODDS = float(os.getenv("BTTS_MAX_ODDS", "15.0"))
+# sanity: чтобы не улетали неадекватные цифры
+OU_ODDS_MIN = float(os.getenv("OU_ODDS_MIN", "1.10"))
+OU_ODDS_MAX = float(os.getenv("OU_ODDS_MAX", "6.00"))
+BTTS_ODDS_MIN = float(os.getenv("BTTS_ODDS_MIN", "1.10"))
+BTTS_ODDS_MAX = float(os.getenv("BTTS_ODDS_MAX", "6.00"))
 
 STATE_FILE = "state.json"
 
-# В API может быть "Pinnacle", "Pinnacle Sports" и т.п.
-PINNACLE_MATCH = "pinnacle"
+PIN_BOOKMAKER_SLUG = "pinnacle"  # oddsPapi bookmaker slug
 
 # ======================
-# COMPETITIONS
+# TARGET COMPETITIONS (для API-Football)
 # ======================
 TARGET_COMPETITIONS: List[Dict[str, Any]] = [
     {"country": "England", "name": "Premier League", "aliases": ["Premier League"]},
@@ -106,8 +111,26 @@ def chunked(text: str, limit: int = 3500) -> List[str]:
         parts.append(buf)
     return parts
 
+def safe_team_key(name: str) -> str:
+    # лёгкая нормализация, чтобы матчить названия между API-Football и OddsPapi
+    s = norm(name)
+    repl = {
+        "&": "and",
+        "fc ": "",
+        " fc": "",
+        "cf ": "",
+        " cf": "",
+        ".": "",
+        ",": "",
+        "’": "'",
+    }
+    for a, b in repl.items():
+        s = s.replace(a, b)
+    s = " ".join(s.split())
+    return s
+
 # ======================
-# WEATHER
+# WEATHER (optional)
 # ======================
 def weather_factor(city: Optional[str]) -> float:
     if not WEATHER_KEY or not city:
@@ -139,13 +162,13 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # ======================
-# MODEL
+# MODEL (goals)
 # ======================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
         r = requests.get(
             "https://v3.football.api-sports.io/fixtures",
-            headers=HEADERS,
+            headers=HEADERS_FOOTBALL,
             params={"team": team_id, "last": last, "season": SEASON},
             timeout=25
         )
@@ -209,102 +232,7 @@ def value_ev(p: float, book_odds: float) -> float:
     return (p * book_odds) - 1.0
 
 # ======================
-# ODDS (Pinnacle)
-# ======================
-def fetch_fixture_odds(fixture_id: int) -> list:
-    try:
-        r = requests.get(
-            "https://v3.football.api-sports.io/odds",
-            headers=HEADERS,
-            params={"fixture": fixture_id},
-            timeout=25
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", []) or []
-    except Exception as e:
-        print(f"[ERROR] fetch_fixture_odds fixture={fixture_id}: {e}")
-        return []
-
-def is_ou_market(bet_name: str) -> bool:
-    bn = norm(bet_name)
-    keys = ["over/under", "over under", "total goals", "totals", "goals over/under", "match goals"]
-    return any(k in bn for k in keys)
-
-def is_btts_market(bet_name: str) -> bool:
-    bn = norm(bet_name)
-    keys = ["both teams to score", "btts", "both teams score"]
-    return any(k in bn for k in keys)
-
-def label_is_over25(label: str) -> bool:
-    lb = norm(label).replace(",", ".")
-    return ("over" in lb or lb.startswith("o")) and "2.5" in lb
-
-def label_is_under25(label: str) -> bool:
-    lb = norm(label).replace(",", ".")
-    return ("under" in lb or lb.startswith("u")) and "2.5" in lb
-
-def label_is_yes(label: str) -> bool:
-    return norm(label) in ["yes", "y", "да"]
-
-def label_is_no(label: str) -> bool:
-    return norm(label) in ["no", "n", "нет"]
-
-def extract_pinnacle_odds(odds_response: list) -> Tuple[Dict[str, Optional[float]], Optional[str], List[Dict[str, Any]]]:
-    """
-    returns (odds_dict, bookmaker_actual_name, pinnacle_bets_list)
-    """
-    out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
-    if not odds_response:
-        return out, None, []
-
-    for item in odds_response:
-        for bm in (item.get("bookmakers") or []):
-            bm_name = norm(bm.get("name"))
-            if PINNACLE_MATCH not in bm_name:
-                continue
-
-            actual_name = bm.get("name") or "Pinnacle"
-            bets = bm.get("bets") or []
-
-            for bet in bets:
-                bet_name = bet.get("name") or ""
-                values = bet.get("values") or []
-
-                if is_ou_market(bet_name):
-                    for v in values:
-                        label = v.get("value")
-                        try:
-                            odd = float(v.get("odd"))
-                        except:
-                            continue
-                        if odd <= 1.01 or odd > OU_MAX_ODDS:
-                            continue
-                        if label_is_over25(label):
-                            out["O25"] = odd
-                        elif label_is_under25(label):
-                            out["U25"] = odd
-
-                if is_btts_market(bet_name):
-                    for v in values:
-                        label = v.get("value")
-                        try:
-                            odd = float(v.get("odd"))
-                        except:
-                            continue
-                        if odd <= 1.01 or odd > BTTS_MAX_ODDS:
-                            continue
-                        if label_is_yes(label):
-                            out["BTTS_Y"] = odd
-                        elif label_is_no(label):
-                            out["BTTS_N"] = odd
-
-            return out, actual_name, bets
-
-    return out, None, []
-
-# ======================
-# LEAGUES (resolve + cache)
+# API-Football leagues resolve (как было)
 # ======================
 def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": search_text}
@@ -312,7 +240,7 @@ def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, A
         params["country"] = country
     r = requests.get(
         "https://v3.football.api-sports.io/leagues",
-        headers=HEADERS,
+        headers=HEADERS_FOOTBALL,
         params=params,
         timeout=25
     )
@@ -390,17 +318,13 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
 
     return resolved, missing
 
-# ======================
-# FIXTURES FILTERED
-# ======================
 def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
     params = {"date": date_str}
     if use_season:
         params["season"] = SEASON
-
     r = requests.get(
         "https://v3.football.api-sports.io/fixtures",
-        headers=HEADERS,
+        headers=HEADERS_FOOTBALL,
         params=params,
         timeout=25
     )
@@ -429,33 +353,176 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
     return [], league_ids, missing, date_msk
 
 # ======================
+# OddsPapi (oddspapi.io) — tournaments resolve + odds cache
+# ======================
+ODDSPAPI_TOURN_CACHE_KEY = "oddspapi_tournaments"
+ODDSPAPI_TOURN_CACHE_DATE = "oddspapi_tournaments_date"
+
+def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
+    # Oddspapi expects apiKey as query param in examples
+    params = dict(params)
+    params["apiKey"] = ODDSPAPI_KEY
+    url = f"https://api.oddspapi.io{path}"
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def resolve_oddspapi_tournament_ids(force: bool = False) -> Dict[str, int]:
+    """
+    Для устойчивости мы берём ВСЕ турниры soccer (sportId=10)
+    и подбираем tournamentId по (categoryName + tournamentName) с алиасами.
+    """
+    today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
+    if not force and STATE.get(ODDSPAPI_TOURN_CACHE_DATE) == today and STATE.get(ODDSPAPI_TOURN_CACHE_KEY):
+        return {k: int(v) for k, v in STATE[ODDSPAPI_TOURN_CACHE_KEY].items()}
+
+    # sportId=10 = Soccer в примерах документации
+    data = oddspapi_get("/v4/tournaments", {"sportId": 10})
+    out: Dict[str, int] = {}
+
+    # карта нужных турниров по OddsPapi (они могут называться чуть иначе, поэтому алиасы)
+    wanted = [
+        ("England", ["Premier League", "FA Cup", "League Cup", "EFL Cup", "Carabao Cup", "Community Shield"]),
+        ("Germany", ["Bundesliga", "DFB Pokal", "DFB-Pokal", "Super Cup", "DFL Supercup"]),
+        ("Spain", ["LaLiga", "La Liga", "Copa del Rey", "Super Cup", "Supercopa"]),
+        ("Italy", ["Serie A", "Coppa Italia", "Super Cup", "Supercoppa"]),
+        ("France", ["Ligue 1", "Coupe de France", "Super Cup", "Trophee des Champions"]),
+        ("Russia", ["Premier League", "Russian Premier League"]),
+        (None, ["UEFA Champions League", "Champions League", "UEFA Europa League", "Europa League"]),
+    ]
+
+    for t in data:
+        cat = (t.get("categoryName") or "").strip()
+        name = (t.get("tournamentName") or "").strip()
+        tid = t.get("tournamentId")
+        if not tid or not name:
+            continue
+
+        for wcat, aliases in wanted:
+            if wcat and norm(cat) != norm(wcat):
+                continue
+            for a in aliases:
+                if norm(name) == norm(a) or norm(a) in norm(name) or norm(name) in norm(a):
+                    key = f"{cat or 'UEFA'}|{name}"
+                    out[key] = int(tid)
+
+    STATE[ODDSPAPI_TOURN_CACHE_KEY] = {k: int(v) for k, v in out.items()}
+    STATE[ODDSPAPI_TOURN_CACHE_DATE] = today
+    save_state(STATE)
+    return out
+
+def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[str, Any]]:
+    ids = ",".join(str(x) for x in tournament_ids)
+    # oddsFormat=decimal, bookmaker=pinnacle as in docs
+    return oddspapi_get(
+        "/v4/odds-by-tournaments",
+        {"tournamentIds": ids, "bookmaker": PIN_BOOKMAKER_SLUG, "oddsFormat": "decimal", "verbosity": 2},
+    )
+
+def parse_pinnacle_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """
+    Возвращает odds: O25, U25, BTTS_Y, BTTS_N
+    В OddsPapi цены лежат в bookmakerOdds[pinnacle].markets[*].outcomes[*].players[0].price
+    Для тоталов ориентируемся по bookmakerOutcomeId: '2.5/over' и '2.5/under' (пример в docs).
+    """
+    out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
+    bm = ((item.get("bookmakerOdds") or {}).get(PIN_BOOKMAKER_SLUG) or {})
+    markets = bm.get("markets") or {}
+
+    for _mid, m in markets.items():
+        outcomes = m.get("outcomes") or {}
+        for _oid, o in outcomes.items():
+            players = o.get("players") or {}
+            p0 = players.get("0") or players.get(0) or {}
+            price = p0.get("price")
+            bok = norm(p0.get("bookmakerOutcomeId"))
+
+            try:
+                price = float(price)
+            except:
+                continue
+
+            # totals 2.5
+            if "2.5/over" in bok:
+                if OU_ODDS_MIN <= price <= OU_ODDS_MAX:
+                    out["O25"] = price
+            elif "2.5/under" in bok:
+                if OU_ODDS_MIN <= price <= OU_ODDS_MAX:
+                    out["U25"] = price
+
+            # BTTS
+            # marketId=104 is "Both Teams To Score" in markets list docs
+            # but here we just match by bookmakerOutcomeId yes/no
+            if bok in ("yes", "btts_yes", "btts/yes"):
+                if BTTS_ODDS_MIN <= price <= BTTS_ODDS_MAX:
+                    out["BTTS_Y"] = price
+            elif bok in ("no", "btts_no", "btts/no"):
+                if BTTS_ODDS_MIN <= price <= BTTS_ODDS_MAX:
+                    out["BTTS_N"] = price
+
+    return out
+
+def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+    """
+    Возвращает map для матчинга:
+      key = (date_msk, team1_norm, team2_norm)  -> item
+    На всякий случай добавляем оба порядка команд.
+    """
+    tourn_map = resolve_oddspapi_tournament_ids(force=False)
+    tourn_ids = list(set(tourn_map.values()))
+    items = fetch_oddspapi_odds_by_tournaments(tourn_ids)
+
+    m: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    for it in items:
+        start = it.get("startTime")
+        t1 = it.get("participant1Name") or ""
+        t2 = it.get("participant2Name") or ""
+        if not start or not t1 or not t2:
+            continue
+
+        # startTime is UTC Z. Convert to MSK date and time.
+        try:
+            dt_utc = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        except:
+            continue
+        dt_msk = dt_utc + timedelta(hours=3)
+        d_msk = dt_msk.strftime("%Y-%m-%d")
+
+        if d_msk != date_msk:
+            continue
+
+        k1 = safe_team_key(t1)
+        k2 = safe_team_key(t2)
+        m[(d_msk, k1, k2)] = it
+        m[(d_msk, k2, k1)] = it
+
+    return m
+
+# ======================
 # HANDLERS
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — Pinnacle mode.\n\n"
+        "🐺 ЦЕРБЕР — Pinnacle odds via OddsPapi.\n\n"
         "Команды:\n"
-        "• /signals — только value-сигналы\n"
-        "• /all — все матчи с P и Pinnacle odds (без фильтров)\n"
-        "• /check — диагностика\n"
-        "• /reload_leagues — пересканировать турниры\n"
-        "• /odds_debug — показать рынки Pinnacle по первому матчу дня\n\n"
+        "• /signals — только value-сигналы (P≥75% & Value>0)\n"
+        "• /all — все матчи с P и Pinnacle odds\n"
+        "• /check — диагностика (есть ли odds от OddsPapi)\n"
+        "• /reload_leagues — пересканировать лиги (API-Football)\n"
+        "• /odds_debug — показать RAW odds по первому матчу\n\n"
         f"Пороги: P ≥ {int(MIN_PROB*100)}%, Value > {MIN_VALUE:+.2f}\n"
+        "Odds-источник: oddspapi.io\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
-    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры…")
+    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую лиги API-Football…")
 
     resolved, missing = resolve_target_league_ids(force=True)
-
-    text = "✅ Найденные турниры:\n"
-    if resolved:
-        for k in sorted(resolved.keys()):
-            text += f"• {k} → ID {resolved[k]}\n"
-    else:
-        text += "• (пусто)\n"
-
+    text = "✅ Найденные лиги:\n"
+    for k in sorted(resolved.keys()):
+        text += f"• {k} → ID {resolved[k]}\n"
     text += "\n❌ Не найдены:\n"
     if missing:
         for m in missing:
@@ -468,105 +535,99 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
+
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет (API-Football).")
         return
 
-    total = len(fixtures)
-    sample = fixtures[:15]
+    # строим карту oddsPapi на этот день (один запрос)
+    try:
+        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ OddsPapi ошибка: {e}")
+        return
 
-    odds_present = 0
-    pinn_present = 0
-    pinn_with_any_market = 0
+    sample = fixtures[:15]
+    matched = 0
+    with_any = 0
 
     for f in sample:
-        fixture_id = (f.get("fixture") or {}).get("id")
-        if not fixture_id:
-            continue
+        home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
+        away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
+        key = (used_date, safe_team_key(home), safe_team_key(away))
+        it = odds_map.get(key)
+        if it:
+            matched += 1
+            odds = parse_pinnacle_from_oddspapi_item(it)
+            if any(odds.values()):
+                with_any += 1
 
-        odds_resp = fetch_fixture_odds(int(fixture_id))
-        if odds_resp:
-            odds_present += 1
-
-        odds_pin, pin_name, _ = extract_pinnacle_odds(odds_resp)
-        if pin_name:
-            pinn_present += 1
-            if any(odds_pin[k] is not None for k in odds_pin.keys()):
-                pinn_with_any_market += 1
-
-    text = (
+    msg = (
         f"🔎 CHECK ({used_date})\n"
-        f"Матчей (после фильтра турниров): {total}\n\n"
-        f"Проверено матчей: {len(sample)}\n"
-        f"Odds ответ не пустой: {odds_present}/{len(sample)}\n"
-        f"Pinnacle найден: {pinn_present}/{len(sample)}\n"
-        f"Pinnacle и есть рынки (OU/BTTS): {pinn_with_any_market}/{len(sample)}\n"
+        f"Матчей (после фильтра лиг): {len(fixtures)}\n"
+        f"Проверено: {len(sample)}\n"
+        f"Сматчено по командам (OddsPapi): {matched}/{len(sample)}\n"
+        f"Сматчено и есть рынки (O/U2.5 или BTTS): {with_any}/{len(sample)}\n"
     )
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    await context.bot.send_message(chat_id=chat_id, text=msg)
 
 async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
+
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
         return
 
-    # берём первый матч
+    try:
+        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ OddsPapi ошибка: {e}")
+        return
+
     f = fixtures[0]
-    fixture = f.get("fixture") or {}
-    fixture_id = fixture.get("id")
-    home = (f.get("teams") or {}).get("home", {}) or {}
-    away = (f.get("teams") or {}).get("away", {}) or {}
-    league = f.get("league", {}) or {}
-    league_name = league.get("name", "?")
+    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
+    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
+    key = (used_date, safe_team_key(home), safe_team_key(away))
+    it = odds_map.get(key)
 
-    if not fixture_id:
-        await context.bot.send_message(chat_id=chat_id, text="Не удалось взять fixture_id.")
+    head = f"🧪 ODDS DEBUG ({used_date})\n{home} — {away}\n\n"
+    if not it:
+        await context.bot.send_message(chat_id=chat_id, text=head + "❌ Не нашёл соответствие в OddsPapi по названиям команд.")
         return
 
-    odds_resp = fetch_fixture_odds(int(fixture_id))
-    odds_pin, pin_name, bets = extract_pinnacle_odds(odds_resp)
+    odds = parse_pinnacle_from_oddspapi_item(it)
+    bm = ((it.get("bookmakerOdds") or {}).get(PIN_BOOKMAKER_SLUG) or {})
+    markets = bm.get("markets") or {}
 
-    header = (
-        f"🧪 ODDS DEBUG ({used_date})\n"
-        f"🏆 {league_name}\n"
-        f"{home.get('name','?')} — {away.get('name','?')}\n"
-        f"fixture_id={fixture_id}\n\n"
-    )
+    lines = [head]
+    lines.append(f"✅ OddsPapi fixtureId: {it.get('fixtureId')}\n")
+    lines.append(f"startTime (UTC): {it.get('startTime')}\n")
+    lines.append(f"Pinnacle markets count: {len(markets)}\n\n")
+    lines.append("🎯 Extracted:\n")
+    lines.append(f"Over 2.5: {odds['O25']}\n")
+    lines.append(f"Under 2.5: {odds['U25']}\n")
+    lines.append(f"BTTS Yes: {odds['BTTS_Y']}\n")
+    lines.append(f"BTTS No: {odds['BTTS_N']}\n\n")
 
-    if not pin_name:
-        await context.bot.send_message(chat_id=chat_id, text=header + "❌ Pinnacle в odds не найден по этому матчу.")
-        return
-
-    lines = [header + f"✅ Найден букмекер: {pin_name}\n\n"]
-
-    # список рынков
-    lines.append("📌 Рынки (bet.name) у Pinnacle (первые 25):\n")
-    for bet in bets[:25]:
-        lines.append(f"• {bet.get('name','?')}\n")
-
-    # показываем конкретные нужные значения
-    lines.append("\n🎯 Найденные значения (что бот пытается парсить):\n")
-    lines.append(f"Over 2.5: {odds_pin['O25']}\n")
-    lines.append(f"Under 2.5: {odds_pin['U25']}\n")
-    lines.append(f"BTTS Yes: {odds_pin['BTTS_Y']}\n")
-    lines.append(f"BTTS No: {odds_pin['BTTS_N']}\n\n")
-
-    # детальный вывод values для OU и BTTS рынков
-    lines.append("🔍 Детально (OU/BTTS рынки и их values):\n")
+    # выводим несколько outcomeId/bookmakerOutcomeId/price (RAW)
+    lines.append("🔍 RAW sample (до 30 строк):\n")
     shown = 0
-    for bet in bets:
-        name = bet.get("name") or ""
-        if not (is_ou_market(name) or is_btts_market(name)):
-            continue
-        lines.append(f"\n[{name}]\n")
-        for v in (bet.get("values") or []):
-            val = v.get("value")
-            odd = v.get("odd")
-            lines.append(f"  - {val}: {odd}\n")
-        shown += 1
-        if shown >= 6:
+    for mid, m in markets.items():
+        outcomes = m.get("outcomes") or {}
+        for oid, o in outcomes.items():
+            players = o.get("players") or {}
+            p0 = players.get("0") or players.get(0) or {}
+            bok = p0.get("bookmakerOutcomeId")
+            price = p0.get("price")
+            if bok is None or price is None:
+                continue
+            lines.append(f"m={mid} o={oid} outcome={bok} price={price}\n")
+            shown += 1
+            if shown >= 30:
+                break
+        if shown >= 30:
             break
 
     for part in chunked("".join(lines)):
@@ -574,28 +635,31 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
-
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
         return
 
-    out = [f"📋 ALL ({used_date}) — все матчи (без фильтра value)\nИсточник odds: Pinnacle\n\n"]
+    try:
+        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ OddsPapi ошибка: {e}")
+        return
+
+    out = [f"📋 ALL ({used_date}) — odds: Pinnacle via OddsPapi\n\n"]
     sent = 0
 
-    for f in fixtures[:20]:
+    for f in fixtures[:30]:
         fixture = f.get("fixture") or {}
-        fixture_id = fixture.get("id")
         home = (f.get("teams") or {}).get("home", {}) or {}
         away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
-        league_name = league.get("name", "?")
         venue = fixture.get("venue", {}) or {}
         city = venue.get("city")
 
         home_id = home.get("id")
         away_id = away.get("id")
-        if not home_id or not away_id or not fixture_id:
+        if not home_id or not away_id:
             continue
 
         hs = analyze_goals(get_last_matches(int(home_id), last=5))
@@ -604,7 +668,6 @@ async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         w_k = weather_factor(city)
-
         p_o25 = prob_over25(hs, as_, w_k)
         p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
         p_btts_y = prob_btts_yes(hs, as_, w_k)
@@ -616,27 +679,29 @@ async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
-        odds_resp = fetch_fixture_odds(int(fixture_id))
-        odds_pin, pin_name, _ = extract_pinnacle_odds(odds_resp)
-        pin_name = pin_name or "Pinnacle (not found)"
+        key = (used_date, safe_team_key(home.get("name", "")), safe_team_key(away.get("name", "")))
+        it = odds_map.get(key)
+        odds = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
+        if it:
+            odds = parse_pinnacle_from_oddspapi_item(it)
 
         def line(title: str, p: float, book: Optional[float]) -> str:
             if book is None:
                 return f"{title}: P={int(p*100)}% | Book=—"
             v = value_ev(p, book)
-            return f"{title}: P={int(p*100)}% | Book={float(book):.2f} | Value={v:+.2f}"
+            return f"{title}: P={int(p*100)}% | Book={book:.2f} | Value={v:+.2f}"
 
         out.append(
-            f"🏆 {league_name}\n{home.get('name','?')} — {away.get('name','?')} | 🕒 {t_str}\n"
-            f"Odds: {pin_name}\n"
-            f"{line('ТБ2.5', p_o25, odds_pin['O25'])}\n"
-            f"{line('ТМ2.5', p_u25, odds_pin['U25'])}\n"
-            f"{line('ОЗ Да', p_btts_y, odds_pin['BTTS_Y'])}\n"
-            f"{line('ОЗ Нет', p_btts_n, odds_pin['BTTS_N'])}\n\n"
+            f"🏆 {league.get('name','?')}\n"
+            f"{home.get('name','?')} — {away.get('name','?')} | 🕒 {t_str}\n"
+            f"{line('ТБ2.5', p_o25, odds['O25'])}\n"
+            f"{line('ТМ2.5', p_u25, odds['U25'])}\n"
+            f"{line('ОЗ Да', p_btts_y, odds['BTTS_Y'])}\n"
+            f"{line('ОЗ Нет', p_btts_n, odds['BTTS_N'])}\n\n"
         )
 
         sent += 1
-        if sent % 5 == 0:
+        if sent % 6 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(out))
             out = ["(продолжение)\n\n"]
 
@@ -645,29 +710,40 @@ async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
-
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
         return
 
-    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nИсточник odds: Pinnacle\n\n"]
+    try:
+        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ OddsPapi ошибка: {e}")
+        return
+
+    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nOdds: Pinnacle via OddsPapi\n\n"]
     found_any = 0
     count = 0
 
     for f in fixtures:
         fixture = f.get("fixture") or {}
-        fixture_id = fixture.get("id")
         home = (f.get("teams") or {}).get("home", {}) or {}
         away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
-        league_name = league.get("name", "?")
         venue = fixture.get("venue", {}) or {}
         city = venue.get("city")
 
         home_id = home.get("id")
         away_id = away.get("id")
-        if not home_id or not away_id or not fixture_id:
+        if not home_id or not away_id:
+            continue
+
+        key = (used_date, safe_team_key(home.get("name", "")), safe_team_key(away.get("name", "")))
+        it = odds_map.get(key)
+        if not it:
+            continue
+        odds = parse_pinnacle_from_oddspapi_item(it)
+        if not any(odds.values()):
             continue
 
         hs = analyze_goals(get_last_matches(int(home_id), last=5))
@@ -676,7 +752,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         w_k = weather_factor(city)
-
         p_o25 = prob_over25(hs, as_, w_k)
         p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
         p_btts_y = prob_btts_yes(hs, as_, w_k)
@@ -687,11 +762,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ts:
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
-
-        odds_resp = fetch_fixture_odds(int(fixture_id))
-        odds_pin, pin_name, _ = extract_pinnacle_odds(odds_resp)
-        if not pin_name:
-            continue
 
         def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
             if book is None:
@@ -701,14 +771,14 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             v = value_ev(p, book)
             if v <= MIN_VALUE:
                 return None
-            return f"{title}: P={int(p*100)}% | Book={float(book):.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
+            return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
 
         lines = []
         for title, p, book in [
-            ("ТБ 2.5", p_o25, odds_pin["O25"]),
-            ("ТМ 2.5", p_u25, odds_pin["U25"]),
-            ("ОЗ Да", p_btts_y, odds_pin["BTTS_Y"]),
-            ("ОЗ Нет", p_btts_n, odds_pin["BTTS_N"]),
+            ("ТБ 2.5", p_o25, odds["O25"]),
+            ("ТМ 2.5", p_u25, odds["U25"]),
+            ("ОЗ Да", p_btts_y, odds["BTTS_Y"]),
+            ("ОЗ Нет", p_btts_n, odds["BTTS_N"]),
         ]:
             ml = market_line(title, p, book)
             if ml:
@@ -719,7 +789,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         found_any += 1
         out.append(
-            f"🏆 {league_name}\n"
+            f"🏆 {league.get('name','?')}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n" +
             "\n".join(lines) +
@@ -735,7 +805,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"📭 На дату {used_date} нет value-сигналов по Pinnacle при порогах:\n"
+                f"📭 На дату {used_date} нет value-сигналов при порогах:\n"
                 f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n\n"
                 "Проверка:\n"
                 "• /check\n"
@@ -763,5 +833,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
