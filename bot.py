@@ -14,11 +14,16 @@ API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+if not CHAT_ID:
+    raise ValueError("TELEGRAM_CHAT_ID не задан в переменных окружения!")
+
 MIN_PROB = 0.75
 SEASON = 2025
 HEADERS = {"x-apisports-key": API_KEY}
 REF_FILE = "referees.json"
-TEAM_IDS = [39, 140, 135, 78, 235]  # Англия, Испания, Италия, Германия, Россия
+TEAM_IDS = [39, 140, 135, 78, 235]
 
 # ======================
 # СУДЬИ
@@ -52,50 +57,54 @@ def fetch_team_fixtures(team_id, last=20):
             timeout=15
         ).json()
         return r.get("response", [])
-    except:
+    except Exception as e:
+        print(f"[ERROR] fetch_team_fixtures {team_id}: {e}")
         return []
 
 def update_referees():
     global REFEREES
-    for team_id in TEAM_IDS:
-        fixtures = fetch_team_fixtures(team_id)
-        for f in fixtures:
-            referee = f["fixture"]["referee"]
-            if not referee:
-                continue
+    try:
+        for team_id in TEAM_IDS:
+            fixtures = fetch_team_fixtures(team_id)
+            for f in fixtures:
+                referee = f["fixture"]["referee"]
+                if not referee:
+                    continue
 
-            if referee not in REFEREES:
-                REFEREES[referee] = {"penalties_per_game": 0, "avg_goals": 0, "count": 0}
+                if referee not in REFEREES:
+                    REFEREES[referee] = {"penalties_per_game": 0, "avg_goals": 0, "count": 0}
 
-            pen = REFEREES[referee]["penalties_per_game"] * REFEREES[referee]["count"]
-            goals = REFEREES[referee]["avg_goals"] * REFEREES[referee]["count"]
-            count = REFEREES[referee]["count"]
+                pen = REFEREES[referee]["penalties_per_game"] * REFEREES[referee]["count"]
+                goals = REFEREES[referee]["avg_goals"] * REFEREES[referee]["count"]
+                count = REFEREES[referee]["count"]
 
-            h, a = f["goals"]["home"], f["goals"]["away"]
-            if h is None or a is None:
-                continue
-            total_goals = h + a
+                h, a = f["goals"]["home"], f["goals"]["away"]
+                if h is None or a is None:
+                    continue
+                total_goals = h + a
 
-            penalties = 0
-            for e in f.get("events", []):
-                if e.get("type") == "Penalty":
-                    penalties += 1
+                penalties = 0
+                for e in f.get("events", []):
+                    if e.get("type") == "Penalty":
+                        penalties += 1
 
-            count += 1
-            pen = (pen + penalties) / count
-            goals = (goals + total_goals) / count
+                count += 1
+                pen = (pen + penalties) / count
+                goals = (goals + total_goals) / count
 
-            REFEREES[referee] = {
-                "penalties_per_game": pen,
-                "avg_goals": goals,
-                "count": count
-            }
+                REFEREES[referee] = {
+                    "penalties_per_game": pen,
+                    "avg_goals": goals,
+                    "count": count
+                }
 
-    for r in REFEREES:
-        REFEREES[r].pop("count", None)
+        for r in REFEREES:
+            REFEREES[r].pop("count", None)
 
-    save_referees()
-    print(f"[{datetime.now()}] База судей обновлена. Всего судей: {len(REFEREES)}")
+        save_referees()
+        print(f"[{datetime.now()}] База судей обновлена. Всего судей: {len(REFEREES)}")
+    except Exception as e:
+        print(f"[ERROR] update_referees: {e}")
 
 # ======================
 # ПОГОДА
@@ -117,20 +126,25 @@ def weather_factor(city):
         if r["wind"]["speed"] > 8:
             factor *= 0.96
         return factor
-    except:
+    except Exception as e:
+        print(f"[ERROR] weather_factor {city}: {e}")
         return 1.0
 
 # ======================
 # ГОЛЫ
 # ======================
 def get_last_matches(team_id):
-    r = requests.get(
-        "https://v3.football.api-sports.io/fixtures",
-        headers=HEADERS,
-        params={"team": team_id, "last": 5, "season": SEASON},
-        timeout=15
-    ).json()
-    return r.get("response", [])
+    try:
+        r = requests.get(
+            "https://v3.football.api-sports.io/fixtures",
+            headers=HEADERS,
+            params={"team": team_id, "last": 5, "season": SEASON},
+            timeout=15
+        ).json()
+        return r.get("response", [])
+    except Exception as e:
+        print(f"[ERROR] get_last_matches {team_id}: {e}")
+        return []
 
 def analyze_goals(matches):
     total, btts, over = 0, 0, 0
@@ -163,18 +177,19 @@ def calculate_probability(hs, as_, weather_k, ref_k):
     prob *= ref_k
     return min(prob, 0.88)
 
-# ======================
-# МАТЧИ
-# ======================
 def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    r = requests.get(
-        "https://v3.football.api-sports.io/fixtures",
-        headers=HEADERS,
-        params={"date": today, "season": SEASON},
-        timeout=15
-    ).json()
-    return r.get("response", [])
+    try:
+        r = requests.get(
+            "https://v3.football.api-sports.io/fixtures",
+            headers=HEADERS,
+            params={"date": today, "season": SEASON},
+            timeout=15
+        ).json()
+        return r.get("response", [])
+    except Exception as e:
+        print(f"[ERROR] get_today_matches: {e}")
+        return []
 
 # ======================
 # TELEGRAM
@@ -187,63 +202,73 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures = get_today_matches()
-    if not fixtures:
-        await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Сегодня матчей не найдено в API.")
-        return
+    try:
+        fixtures = get_today_matches()
+        if not fixtures:
+            await context.bot.send_message(chat_id=CHAT_ID, text="⚠️ Сегодня матчей не найдено в API.")
+            return
 
-    msg = "⚽ ПРОВЕРКА СИГНАЛОВ ЦЕРБЕРА (ВСЕ МАТЧИ)\n\n"
-    for f in fixtures:
-        home = f["teams"]["home"]
-        away = f["teams"]["away"]
-        city = f["fixture"]["venue"]["city"]
-        referee = f["fixture"]["referee"]
+        msg = "⚽ ПРОВЕРКА СИГНАЛОВ ЦЕРБЕРА (ВСЕ МАТЧИ)\n\n"
+        for f in fixtures:
+            home = f["teams"]["home"]
+            away = f["teams"]["away"]
+            city = f["fixture"]["venue"]["city"]
+            referee = f["fixture"]["referee"]
 
-        hs = analyze_goals(get_last_matches(home["id"]))
-        as_ = analyze_goals(get_last_matches(away["id"]))
-        if not hs or not as_:
-            continue
+            hs = analyze_goals(get_last_matches(home["id"]))
+            as_ = analyze_goals(get_last_matches(away["id"]))
+            if not hs or not as_:
+                continue
 
-        prob = calculate_probability(
-            hs,
-            as_,
-            weather_factor(city),
-            referee_factor(referee)
-        )
+            prob = calculate_probability(
+                hs,
+                as_,
+                weather_factor(city),
+                referee_factor(referee)
+            )
 
-        time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
-        msg += (
-            f"{home['name']} — {away['name']}\n"
-            f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
-            f"Вероятность ТБ 2.5: {int(prob*100)}%\n\n"
-        )
+            time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
+            msg += (
+                f"{home['name']} — {away['name']}\n"
+                f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
+                f"Вероятность ТБ 2.5: {int(prob*100)}%\n\n"
+            )
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+    except Exception as e:
+        await context.bot.send_message(chat_id=CHAT_ID, text=f"[ERROR] signals: {e}")
+        print(f"[ERROR] signals: {e}")
 
 # ======================
 # ФОН
 # ======================
 async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
-    print(f"[{datetime.now()}] Ежедневное обновление базы судей...")
-    update_referees()
-    print(f"[{datetime.now()}] База судей обновлена.")
+    try:
+        print(f"[{datetime.now()}] Ежедневное обновление базы судей...")
+        update_referees()
+        print(f"[{datetime.now()}] База судей обновлена.")
+    except Exception as e:
+        print(f"[ERROR] daily_ref_update: {e}")
 
 # ======================
 # ЗАПУСК
 # ======================
 async def main():
-    # Используем асинхронный контекст, job_queue гарантированно создаётся
-    async with ApplicationBuilder().token(BOT_TOKEN).build() as app:
+    try:
+        async with ApplicationBuilder().token(BOT_TOKEN).build() as app:
 
-        # Команды
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("signals", signals))
+            # Команды
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("signals", signals))
 
-        # JobQueue
-        app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
+            # JobQueue
+            app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
 
-        # Запуск бота
-        await app.run_polling()
+            # Запуск бота
+            await app.run_polling()
+    except Exception as e:
+        print(f"[ERROR] main: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
+
