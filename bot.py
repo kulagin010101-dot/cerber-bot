@@ -1,7 +1,6 @@
 import os
 import json
 import requests
-import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -235,7 +234,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"[ERROR] signals: {e}")
 
 # ======================
-# ФОН
+# ЕЖЕДНЕВНОЕ ОБНОВЛЕНИЕ СУДЕЙ
 # ======================
 async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -246,23 +245,16 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
         print(f"[ERROR] daily_ref_update: {e}")
 
 # ======================
-# ЗАПУСК
+# ЗАПУСК БОТА (Railway-friendly)
 # ======================
-async def main():
-    try:
-        async def setup(app):
-            app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
-            print("JobQueue настроен")
-
-        async with ApplicationBuilder().token(BOT_TOKEN).post_init(setup).build() as app:
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("signals", signals))
-
-            await app.run_polling()
-    except Exception as e:
-        print(f"[ERROR] main: {e}")
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def setup(app):
+        app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
+        print("JobQueue настроен")
 
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(setup).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signals", signals))
 
+    # Polling напрямую без asyncio.run()
+    app.run_polling()
