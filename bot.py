@@ -25,45 +25,44 @@ HEADERS = {"x-apisports-key": API_KEY}
 SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 
-REF_FILE = "referees.json"
 STATE_FILE = "state.json"
 
 # ======================
-# TARGET COMPETITIONS
+# TARGET COMPETITIONS + ALIASES
 # ======================
-TARGET_COMPETITIONS: List[Dict[str, Optional[str]]] = [
+TARGET_COMPETITIONS: List[Dict[str, Any]] = [
     # England
-    {"country": "England", "name": "Premier League"},
-    {"country": "England", "name": "FA Cup"},
-    {"country": "England", "name": "League Cup"},
-    {"country": "England", "name": "Community Shield"},
+    {"country": "England", "name": "Premier League", "aliases": ["Premier League"]},
+    {"country": "England", "name": "FA Cup", "aliases": ["FA Cup"]},
+    {"country": "England", "name": "League Cup", "aliases": ["League Cup", "EFL Cup", "Carabao Cup"]},
+    {"country": "England", "name": "Community Shield", "aliases": ["Community Shield", "FA Community Shield"]},
 
     # Germany
-    {"country": "Germany", "name": "Bundesliga"},
-    {"country": "Germany", "name": "DFB Pokal"},
-    {"country": "Germany", "name": "Super Cup"},
+    {"country": "Germany", "name": "Bundesliga", "aliases": ["Bundesliga", "Bundesliga 1", "1. Bundesliga"]},
+    {"country": "Germany", "name": "DFB Pokal", "aliases": ["DFB Pokal", "DFB-Pokal", "German Cup"]},
+    {"country": "Germany", "name": "Super Cup", "aliases": ["Super Cup", "DFL Supercup", "German Super Cup"]},
 
     # Spain
-    {"country": "Spain", "name": "La Liga"},
-    {"country": "Spain", "name": "Copa del Rey"},
-    {"country": "Spain", "name": "Super Cup"},
+    {"country": "Spain", "name": "La Liga", "aliases": ["La Liga", "LaLiga", "Primera Division", "La Liga Santander"]},
+    {"country": "Spain", "name": "Copa del Rey", "aliases": ["Copa del Rey", "Copa Del Rey", "King's Cup"]},
+    {"country": "Spain", "name": "Super Cup", "aliases": ["Super Cup", "Supercopa", "Supercopa de Espana"]},
 
     # Italy
-    {"country": "Italy", "name": "Serie A"},
-    {"country": "Italy", "name": "Coppa Italia"},
-    {"country": "Italy", "name": "Super Cup"},
+    {"country": "Italy", "name": "Serie A", "aliases": ["Serie A"]},
+    {"country": "Italy", "name": "Coppa Italia", "aliases": ["Coppa Italia", "Italy Cup"]},
+    {"country": "Italy", "name": "Super Cup", "aliases": ["Super Cup", "Supercoppa", "Supercoppa Italiana"]},
 
     # France
-    {"country": "France", "name": "Ligue 1"},
-    {"country": "France", "name": "Coupe de France"},
-    {"country": "France", "name": "Super Cup"},
+    {"country": "France", "name": "Ligue 1", "aliases": ["Ligue 1"]},
+    {"country": "France", "name": "Coupe de France", "aliases": ["Coupe de France", "French Cup"]},
+    {"country": "France", "name": "Super Cup", "aliases": ["Super Cup", "Trophee des Champions"]},
 
     # Russia
-    {"country": "Russia", "name": "Premier League"},
+    {"country": "Russia", "name": "Premier League", "aliases": ["Premier League", "Russian Premier League", "Premier Liga"]},
 
     # UEFA
-    {"country": None, "name": "UEFA Champions League"},
-    {"country": None, "name": "UEFA Europa League"},
+    {"country": None, "name": "UEFA Champions League", "aliases": ["UEFA Champions League", "Champions League", "UCL"]},
+    {"country": None, "name": "UEFA Europa League", "aliases": ["UEFA Europa League", "Europa League", "UEL"]},
 ]
 
 # ======================
@@ -85,34 +84,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # ======================
-# REFEREES DB (оставлено как раньше; судья влияет только если есть в базе)
-# ======================
-def load_referees() -> Dict[str, Any]:
-    if os.path.exists(REF_FILE):
-        try:
-            with open(REF_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-REFEREES: Dict[str, Any] = load_referees()
-
-def referee_factor(name: Optional[str]) -> float:
-    if not name:
-        return 1.0
-    ref = REFEREES.get(name)
-    if not ref:
-        return 1.0
-    pen = float(ref.get("penalties_per_game", 0))
-    if pen >= 0.30:
-        return 1.07
-    if pen <= 0.18:
-        return 0.94
-    return 1.0
-
-# ======================
-# WEATHER
+# WEATHER (опционально)
 # ======================
 def weather_factor(city: Optional[str]) -> float:
     if not WEATHER_KEY or not city:
@@ -189,7 +161,7 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
         "over25": over25 / n
     }
 
-def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float, r_k: float) -> float:
+def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
     prob = 0.60
     base = (hs["avg"] + as_["avg"]) / 2.0
 
@@ -203,14 +175,13 @@ def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float, r_
         prob += 0.04
 
     prob *= w_k
-    prob *= r_k
     return min(max(prob, 0.05), 0.90)
 
 # ======================
-# LEAGUES LOOKUP + CACHE
+# LEAGUES LOOKUP (SMART)
 # ======================
-def leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
-    params = {"search": name}
+def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
+    params = {"search": search_text}
     if country:
         params["country"] = country
     r = requests.get(
@@ -221,23 +192,41 @@ def leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
     )
     r.raise_for_status()
     data = r.json()
-    if data.get("errors"):
-        print("[API errors]", data["errors"])
     return data.get("response", [])
 
+def score_candidate(target_country: Optional[str], aliases: List[str], cand_name: str, cand_country: str) -> int:
+    """
+    Чем больше score — тем лучше.
+    """
+    tn = cand_name.strip().lower()
+    tc = cand_country.strip().lower()
+
+    score = 0
+    if target_country:
+        if tc == target_country.strip().lower():
+            score += 50
+        else:
+            score -= 10  # лёгкий штраф
+
+    for a in aliases:
+        al = a.strip().lower()
+        if tn == al:
+            score += 100
+        elif al in tn:
+            score += 60
+        elif tn in al:
+            score += 40
+
+    return score
+
 def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List[str]]:
-    """
-    Возвращает (resolved_ids, missing_keys)
-    key = f"{country or 'UEFA'}|{name}"
-    """
     cache = STATE.get("league_ids", {})
+    missing_cache = STATE.get("league_missing", [])
     cache_date = STATE.get("league_ids_date")
 
-    today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата
+    today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
     if (not force) and cache and cache_date == today:
-        resolved = {k: int(v) for k, v in cache.items()}
-        missing = STATE.get("league_missing", [])
-        return resolved, missing
+        return {k: int(v) for k, v in cache.items()}, list(missing_cache)
 
     resolved: Dict[str, int] = {}
     missing: List[str] = []
@@ -245,44 +234,49 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
     for item in TARGET_COMPETITIONS:
         country = item["country"]
         name = item["name"]
+        aliases = item.get("aliases") or [name]
         key = f"{(country or 'UEFA')}|{name}"
 
-        results = []
-        try:
-            results = leagues_search(name=name, country=country)
-        except Exception as e:
-            print(f"[ERROR] leagues_search {key}: {e}")
-            results = []
-
         best_id = None
+        best_score = -999999
+        best_debug = None
 
-        # 1) точное совпадение названия
-        for rr in results:
-            lg = rr.get("league", {})
-            nm = (lg.get("name") or "").strip()
-            if nm.lower() == name.lower():
-                best_id = lg.get("id")
-                break
+        # Пробуем по всем алиасам; сначала с country, потом без country
+        for alias in aliases:
+            for ctry in [country, None]:
+                try:
+                    results = leagues_search(alias, ctry)
+                except Exception as e:
+                    print(f"[ERROR] leagues_search {key} alias={alias} country={ctry}: {e}")
+                    results = []
 
-        # 2) если нет точного — берём первый, но отметим это в логах
-        if best_id is None and results:
-            best_id = results[0].get("league", {}).get("id")
-            got_name = (results[0].get("league", {}).get("name") or "?")
-            got_country = (results[0].get("country", {}).get("name") or "?")
-            print(f"[WARN] not exact match for {key}. Using first: {got_country}|{got_name} id={best_id}")
+                for rr in results:
+                    lg = rr.get("league", {}) or {}
+                    cn = rr.get("country", {}) or {}
+                    cand_name = (lg.get("name") or "").strip()
+                    cand_country = (cn.get("name") or "").strip()
+
+                    if not cand_name:
+                        continue
+
+                    sc = score_candidate(country, aliases, cand_name, cand_country)
+                    if sc > best_score:
+                        best_score = sc
+                        best_id = lg.get("id")
+                        best_debug = f"{cand_country}|{cand_name} id={best_id} score={sc}"
 
         if best_id:
             resolved[key] = int(best_id)
+            print(f"[INFO] League resolved {key} -> {best_debug}")
         else:
             missing.append(key)
-            print(f"[WARN] League not found: {key}")
+            print(f"[WARN] League NOT found: {key}")
 
     STATE["league_ids"] = {k: int(v) for k, v in resolved.items()}
-    STATE["league_ids_date"] = today
     STATE["league_missing"] = missing
+    STATE["league_ids_date"] = today
     save_state(STATE)
 
-    print(f"[INFO] Resolved leagues count={len(resolved)} missing={len(missing)}")
     return resolved, missing
 
 # ======================
@@ -301,8 +295,6 @@ def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
     )
     r.raise_for_status()
     data = r.json()
-    if data.get("errors"):
-        print("[API errors]", data["errors"])
     return data.get("response", [])
 
 def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str], str]:
@@ -317,11 +309,7 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
             try:
                 fixtures = fetch_fixtures_by_date(date_str, use_season=use_season)
                 if fixtures:
-                    filtered = []
-                    for f in fixtures:
-                        lid = (f.get("league", {}) or {}).get("id")
-                        if lid in allowed_ids:
-                            filtered.append(f)
+                    filtered = [f for f in fixtures if (f.get("league", {}) or {}).get("id") in allowed_ids]
                     print(f"[INFO] Fixtures {date_str} use_season={use_season}: total={len(fixtures)} filtered={len(filtered)}")
                     if filtered:
                         return filtered, league_ids, missing, date_str
@@ -336,10 +324,8 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
 def target_chat_id(update: Update) -> str:
     return DEFAULT_CHAT_ID or str(update.effective_chat.id)
 
-def chunked_send(text: str, limit: int = 3500) -> List[str]:
-    # Telegram limit ~4096, оставим запас
-    parts = []
-    buf = ""
+def chunked(text: str, limit: int = 3500) -> List[str]:
+    parts, buf = [], ""
     for line in text.splitlines(True):
         if len(buf) + len(line) > limit:
             parts.append(buf)
@@ -354,36 +340,89 @@ def chunked_send(text: str, limit: int = 3500) -> List[str]:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР (рынок ГОЛОВ) — фильтр турниров включён.\n\n"
+        "🐺 ЦЕРБЕР — фильтр турниров включён.\n\n"
         "Команды:\n"
-        "• /signals — матчи дня (только выбранные турниры) + вероятность ТБ2.5\n"
-        "• /reload_leagues — пересканировать турниры и показать что найдено/не найдено\n"
+        "• /signals — матчи дня только по выбранным турнирам\n"
+        "• /reload_leagues — пересканировать турниры (покажет найдено/не найдено)\n"
+        "• /debug_league <страна|UEFA> <поиск> — показать как API называет турнир\n\n"
+        "Пример: /debug_league Spain liga"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
+    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры…")
 
-    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры (league IDs)…")
     resolved, missing = resolve_target_league_ids(force=True)
 
-    lines = []
-    lines.append("✅ Найденные турниры:\n")
+    text = "✅ Найденные турниры:\n"
     if resolved:
-        # сортируем красиво
         for k in sorted(resolved.keys()):
-            lines.append(f"• {k} → ID {resolved[k]}\n")
+            text += f"• {k} → ID {resolved[k]}\n"
     else:
-        lines.append("• (пусто)\n")
+        text += "• (пусто)\n"
 
-    lines.append("\n❌ Не найдены:\n")
+    text += "\n❌ Не найдены:\n"
     if missing:
-        for k in missing:
-            lines.append(f"• {k}\n")
+        for m in missing:
+            text += f"• {m}\n"
     else:
-        lines.append("• (все найдены)\n")
+        text += "• (все найдены)\n"
 
-    text = "".join(lines)
-    for part in chunked_send(text):
+    for part in chunked(text):
+        await context.bot.send_message(chat_id=chat_id, text=part)
+
+async def debug_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /debug_league Spain liga
+    /debug_league Germany bundes
+    /debug_league UEFA champions
+    """
+    chat_id = target_chat_id(update)
+    args = context.args
+
+    if len(args) < 2:
+        await context.bot.send_message(chat_id=chat_id, text="Используй: /debug_league <страна|UEFA> <поиск>")
+        return
+
+    c = args[0]
+    q = " ".join(args[1:]).strip()
+
+    country = None if c.strip().upper() == "UEFA" else c.strip()
+
+    try:
+        res1 = leagues_search(q, country)
+        res2 = [] if country is None else leagues_search(q, None)  # без country как доказательство
+        combined = res1 + res2
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"Ошибка поиска лиг: {e}")
+        return
+
+    if not combined:
+        await context.bot.send_message(chat_id=chat_id, text="Ничего не найдено.")
+        return
+
+    lines = [f"🔎 Результаты API для: country={country} search='{q}' (первые 10)\n\n"]
+    shown = 0
+    seen = set()
+    for rr in combined:
+        lg = rr.get("league", {}) or {}
+        cn = rr.get("country", {}) or {}
+        lid = lg.get("id")
+        nm = (lg.get("name") or "").strip()
+        cc = (cn.get("name") or "").strip()
+        if not lid or not nm:
+            continue
+        key = (lid, nm, cc)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        lines.append(f"• {cc}|{nm} → ID {lid}\n")
+        shown += 1
+        if shown >= 10:
+            break
+
+    for part in chunked("".join(lines)):
         await context.bot.send_message(chat_id=chat_id, text=part)
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,30 +430,25 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     fixtures, league_ids, missing, used_date = get_today_matches_filtered()
     if not fixtures:
-        msg = (
-            f"⚠️ На дату {used_date} матчей по выбранным турнирам не найдено.\n\n"
-            f"Сейчас в кэше турниров: {len(league_ids)}\n"
-        )
+        msg = f"⚠️ На дату {used_date} матчей по выбранным турнирам не найдено.\n"
+        msg += f"В кэше турниров: {len(league_ids)}\n"
         if missing:
-            msg += "❌ Не найдены турниры:\n" + "\n".join(f"• {m}" for m in missing[:10])
-            if len(missing) > 10:
-                msg += f"\n…и ещё {len(missing)-10}"
-        msg += "\n\nПопробуй: /reload_leagues"
+            msg += "\n❌ Не найдены турниры:\n" + "\n".join(f"• {m}" for m in missing)
+        msg += "\n\nПопробуй: /reload_leagues\nИли проверь названия через /debug_league"
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
-    msg_parts = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nТолько выбранные турниры.\n\n"]
-    chunk = 0
+    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\n\n"]
+    count = 0
 
     for f in fixtures:
-        home = f.get("teams", {}).get("home", {})
-        away = f.get("teams", {}).get("away", {})
+        home = f.get("teams", {}).get("home", {}) or {}
+        away = f.get("teams", {}).get("away", {}) or {}
+        league = f.get("league", {}) or {}
+        league_name = league.get("name", "?")
+
         venue = f.get("fixture", {}).get("venue", {}) or {}
         city = venue.get("city")
-        referee = f.get("fixture", {}).get("referee")
-
-        league = f.get("league", {})
-        league_name = league.get("name", "?")
 
         home_id = home.get("id")
         away_id = away.get("id")
@@ -426,7 +460,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not hs or not as_:
             continue
 
-        prob = calc_prob_over25(hs, as_, weather_factor(city), referee_factor(referee))
+        prob = calc_prob_over25(hs, as_, weather_factor(city))
 
         ts = f.get("fixture", {}).get("timestamp")
         t_str = "—"
@@ -434,20 +468,20 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
-        msg_parts.append(
+        out.append(
             f"🏆 {league_name}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
             f"ТБ2.5: {int(prob*100)}%\n\n"
         )
 
-        chunk += 1
-        if chunk % 10 == 0:
-            await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
-            msg_parts = ["(продолжение)\n\n"]
+        count += 1
+        if count % 10 == 0:
+            await context.bot.send_message(chat_id=chat_id, text="".join(out))
+            out = ["(продолжение)\n\n"]
 
-    if msg_parts:
-        await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
+    if out:
+        await context.bot.send_message(chat_id=chat_id, text="".join(out))
 
 # ======================
 # RUN
@@ -457,8 +491,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("reload_leagues", reload_leagues))
+    app.add_handler(CommandHandler("debug_league", debug_league))
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
