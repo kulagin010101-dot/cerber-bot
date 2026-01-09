@@ -4,127 +4,153 @@ from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
+# ======================
+# НАСТРОЙКИ
+# ======================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("FOOTBALL_API_KEY")
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_PROB = 0.75
+SEASON = 2025
 
-LEAGUES = [39, 140, 135, 78, 235]  # топ-лиги
+LEAGUES = {
+    39: "Англия — Премьер-лига",
+    140: "Испания — Ла Лига",
+    135: "Италия — Серия A",
+    78: "Германия — Бундеслига",
+    235: "Россия — РПЛ"
+}
 
-# ======================
-# ФАКТОРЫ
-# ======================
-
-def weather_factor(city):
-    if not WEATHER_KEY:
-        return 1.0
-    try:
-        r = requests.get(
-            f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_KEY}&units=metric",
-            timeout=10
-        ).json()
-        temp = r["main"]["temp"]
-        rain = r.get("rain", {}).get("1h", 0)
-        factor = 1.0
-        if temp < 5 or rain > 0:
-            factor *= 0.93
-        return factor
-    except:
-        return 1.0
-
-def motivation_factor(rank1, rank2):
-    if abs(rank1 - rank2) <= 3:
-        return 1.1
-    return 1.0
-
-def form_factor(goals_scored):
-    if goals_scored >= 2:
-        return 1.1
-    elif goals_scored <= 1:
-        return 0.9
-    return 1.0
+HEADERS = {"x-apisports-key": API_KEY}
 
 # ======================
-# МАТЧИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ======================
+
+def get_last_matches(team_id, limit=5):
+    url = f"https://v3.football.api-sports.io/fixtures"
+    params = {
+        "team": team_id,
+        "last": limit,
+        "season": SEASON
+    }
+    r = requests.get(url, headers=HEADERS, params=params, timeout=15).json()
+    return r.get("response", [])
+
+def analyze_goals(matches):
+    total_goals = 0
+    btts_yes = 0
+    over_25 = 0
+
+    for m in matches:
+        g_home = m["goals"]["home"]
+        g_away = m["goals"]["away"]
+        if g_home is None or g_away is None:
+            continue
+
+        total_goals += g_home + g_away
+
+        if g_home > 0 and g_away > 0:
+            btts_yes += 1
+        if g_home + g_away > 2:
+            over_25 += 1
+
+    played = len(matches)
+    if played == 0:
+        return None
+
+    return {
+        "avg_goals": total_goals / played,
+        "btts_rate": btts_yes / played,
+        "over25_rate": over_25 / played
+    }
+
+def calculate_probability(home_stats, away_stats):
+    base = (home_stats["avg_goals"] + away_stats["avg_goals"]) / 2
+
+    prob = 0.60
+    if base >= 2.6:
+        prob += 0.08
+    if home_stats["over25_rate"] >= 0.6:
+        prob += 0.05
+    if away_stats["over25_rate"] >= 0.6:
+        prob += 0.05
+    if home_stats["btts_rate"] >= 0.6 and away_stats["btts_rate"] >= 0.6:
+        prob += 0.04
+
+    return min(prob, 0.88)
+
+# ======================
+# МАТЧИ СЕГОДНЯ
 # ======================
 
 def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    headers = {"x-apisports-key": API_KEY}
-    matches = []
+    fixtures = []
 
-    for league in LEAGUES:
-        url = f"https://v3.football.api-sports.io/fixtures?date={today}&league={league}&season=2025"
-        r = requests.get(url, headers=headers, timeout=15).json()
-        for e in r.get("response", []):
-            fixture = e["fixture"]
-            venue = fixture.get("venue") or {}
-            matches.append({
-                "home": e["teams"]["home"]["name"],
-                "away": e["teams"]["away"]["name"],
-                "time": fixture["timestamp"],
-                "city": venue.get("city", "London"),
-                "avg_goals": 2.7,
-                "home_goals": 1.6,
-                "away_goals": 1.2,
-                "home_rank": 10,
-                "away_rank": 12,
-                "odds": 1.9
-            })
-    return matches
+    for league_id in LEAGUES:
+        url = "https://v3.football.api-sports.io/fixtures"
+        params = {
+            "date": today,
+            "league": league_id,
+            "season": SEASON
+        }
+        r = requests.get(url, headers=HEADERS, params=params, timeout=15).json()
+        fixtures.extend(r.get("response", []))
+
+    return fixtures
 
 # ======================
-# ПРОГНОЗ
-# ======================
-
-def predict(match):
-    base = 0.68 if match["avg_goals"] >= 2.7 else 0.66
-    prob = (
-        base
-        * weather_factor(match["city"])
-        * motivation_factor(match["home_rank"], match["away_rank"])
-        * form_factor(match["home_goals"])
-        * form_factor(match["away_goals"])
-    )
-    return prob
-
-# ======================
-# КОМАНДЫ
+# TELEGRAM
 # ======================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР (ГОЛЫ)\n"
-        "Рынок: тоталы, ОЗ, ИТ\n"
-        "Команда: /signals"
+        "🐺 ЦЕРБЕР — рынок ГОЛОВ\n\n"
+        "Я анализирую:\n"
+        "• ТБ / ТМ 2.5\n"
+        "• Обе забьют\n"
+        "• Индивидуальные тоталы\n\n"
+        "Сигналы: /signals"
     )
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    matches = get_today_matches()
-    text = "⚽ СИГНАЛЫ ЦЕРБЕРА (ГОЛЫ)\n\n"
+    fixtures = get_today_matches()
+    message = "⚽ СИГНАЛЫ ЦЕРБЕРА (ГОЛЫ)\n\n"
     found = False
 
-    for m in matches:
-        prob = predict(m)
-        value = prob * m["odds"] - 1
+    for f in fixtures:
+        home = f["teams"]["home"]
+        away = f["teams"]["away"]
 
-        if prob >= MIN_PROB and value > 0:
+        home_matches = get_last_matches(home["id"])
+        away_matches = get_last_matches(away["id"])
+
+        home_stats = analyze_goals(home_matches)
+        away_stats = analyze_goals(away_matches)
+
+        if not home_stats or not away_stats:
+            continue
+
+        prob = calculate_probability(home_stats, away_stats)
+
+        if prob >= MIN_PROB:
             found = True
-            time_msk = datetime.utcfromtimestamp(m["time"]) + timedelta(hours=3)
-            text += (
-                f"{m['home']} — {m['away']} ({time_msk.strftime('%H:%M МСК')})\n"
-                f"ТБ 2.5\n"
-                f"Вероятность: {int(prob*100)}%\n"
-                f"Коэфф.: {m['odds']}\n"
-                f"Value: +{value:.2f}\n\n"
+            time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
+
+            message += (
+                f"{home['name']} — {away['name']}\n"
+                f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
+                f"📊 ТБ 2.5\n"
+                f"Вероятность: {int(prob*100)}%\n\n"
             )
 
     if not found:
-        text = "Сегодня нет value-сигналов от 75% 🐺"
+        message = "Сегодня нет value-сигналов от 75% 🐺"
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=text)
+    await context.bot.send_message(chat_id=CHAT_ID, text=message)
 
 # ======================
 # ЗАПУСК
@@ -138,6 +164,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
