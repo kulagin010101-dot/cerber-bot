@@ -28,10 +28,9 @@ if not ODDSPAPI_KEY:
 HEADERS_FOOTBALL = {"x-apisports-key": FOOTBALL_API_KEY}
 
 SEASON = int(os.getenv("SEASON", "2025"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))   # 75%
-MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00")) # value > 0
+MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
+MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))
 
-# sanity filters for odds
 OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.10")), float(os.getenv("OU_ODDS_MAX", "6.00"))
 BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.10")), float(os.getenv("BTTS_ODDS_MAX", "6.00"))
 
@@ -39,7 +38,6 @@ STATE_FILE = "state.json"
 
 # =====================================================
 # TARGET TOURNAMENTS (Oddspapi)
-# categoryName + tournamentName
 # =====================================================
 TARGET_TOURNAMENTS_ODDSPAPI = [
     ("England", "Premier League"),
@@ -131,12 +129,7 @@ def norm(s: Any) -> str:
     return str(s or "").strip().lower()
 
 def safe_team_key(name: str) -> str:
-    """
-    Сильная нормализация для сматчинга:
-    - убираем диакритику: Atlético -> Atletico
-    - убираем FC/CF/SC/AC
-    - чистим пунктуацию
-    """
+    """Сильная нормализация + убираем диакритику."""
     s = str(name or "").strip().lower()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -155,13 +148,21 @@ def safe_team_key(name: str) -> str:
         "sc ": "",
         " ac": "",
         "ac ": "",
-        "  ": " ",
     }
     for a, b in repl.items():
         s = s.replace(a, b)
-
     s = " ".join(s.split())
     return s
+
+def tokens(s: str) -> set:
+    return set([t for t in safe_team_key(s).split() if t and t not in {"the", "club"}])
+
+def jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    uni = len(a | b)
+    return inter / max(1, uni)
 
 def clamp(x: float, lo: float = 0.05, hi: float = 0.95) -> float:
     return min(max(x, lo), hi)
@@ -354,7 +355,6 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
     STATE["league_missing"] = missing
     STATE["league_ids_date"] = today
     save_state(STATE)
-
     return resolved, missing
 
 def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
@@ -412,7 +412,6 @@ def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
 
         if r.status_code >= 400:
             raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:300]}")
-
         return r.json()
 
     raise RuntimeError("OddsPapi: слишком много 429 подряд, попробуй позже.")
@@ -463,11 +462,9 @@ def resolve_target_tournament_ids(force: bool = False) -> Dict[str, int]:
 def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[str, Any]]:
     all_items: List[Dict[str, Any]] = []
     MAX_IDS = 5
-
     for i in range(0, len(tournament_ids), MAX_IDS):
         chunk = tournament_ids[i:i + MAX_IDS]
         ids = ",".join(str(x) for x in chunk)
-
         part = oddspapi_get(
             "/v4/odds-by-tournaments",
             {
@@ -479,16 +476,13 @@ def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[s
         )
         if isinstance(part, list):
             all_items.extend(part)
-
-        time.sleep(0.08)  # микропаузa
-
+        time.sleep(0.08)
     return all_items
 
 def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """
-    Расширенный парсер под 1xBet:
-    - OU 2.5: ловим '2.5'/'2_5' + over/under/ov/un
-    - BTTS: ловим btts/both/teams_to_score/gg + yes/no
+    Расширенный парсер. Это НЕ "заглушка": мы реально читаем outcomeId.
+    Если у 1xBet формат иной — /odds_debug покажет, и мы донастроим точечно.
     """
     out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
     bm = ((item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
@@ -509,18 +503,17 @@ def parse_book_odds_from_oddspapi_item(item: Dict[str, Any]) -> Dict[str, Option
             p0 = players.get("0") or players.get(0) or {}
             price = p0.get("price")
             oid = norm(p0.get("bookmakerOutcomeId"))
-
             if not oid or price is None:
                 continue
 
-            # ---- OU 2.5 ----
-            has_25 = ("2.5" in oid) or ("2_5" in oid) or ("25" in oid and "2" in oid and "5" in oid)
-            if has_25 and ("over" in oid or "_ov" in oid or " ov" in oid):
+            # OU 2.5
+            has_25 = ("2.5" in oid) or ("2_5" in oid)
+            if has_25 and ("over" in oid or "ov" in oid):
                 set_if_ok("O25", price, OU_MIN, OU_MAX)
-            if has_25 and ("under" in oid or "_un" in oid or " un" in oid):
+            if has_25 and ("under" in oid or "un" in oid):
                 set_if_ok("U25", price, OU_MIN, OU_MAX)
 
-            # ---- BTTS ----
+            # BTTS
             if ("btts" in oid) or ("both" in oid) or ("teams_to_score" in oid) or ("gg" in oid):
                 if ("yes" in oid) or oid.endswith("_y") or oid.endswith("_yes"):
                     set_if_ok("BTTS_Y", price, BTTS_MIN, BTTS_MAX)
@@ -534,18 +527,29 @@ ODDS_CACHE_KEY = "odds_cache"
 ODDS_CACHE_TS = "odds_cache_ts"
 ODDS_CACHE_DATE = "odds_cache_date"
 
-def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, str], Dict[str, Any]]:
+# Для fuzzy matching — храним список odds-матчей с временем
+ODDS_INDEX_KEY = "odds_index"
+ODDS_INDEX_DATE = "odds_index_date"
+
+def build_oddspapi_for_day(date_msk: str) -> Tuple[Dict[Tuple[str, str, str], Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Возвращает:
+    - dict map: (date, home_key, away_key) -> item
+    - list index: [{"d":..., "h":..., "a":..., "ts":..., "item":...}, ...]
+    """
     now_ts = time.time()
     cached_date = STATE.get(ODDS_CACHE_DATE)
     cached_ts = float(STATE.get(ODDS_CACHE_TS, 0) or 0)
     cached = STATE.get(ODDS_CACHE_KEY)
+    cached_index = STATE.get(ODDS_INDEX_KEY)
+    cached_index_date = STATE.get(ODDS_INDEX_DATE)
 
-    if cached_date == date_msk and isinstance(cached, dict) and (now_ts - cached_ts) < 60:
-        out = {}
+    if cached_date == date_msk and isinstance(cached, dict) and (now_ts - cached_ts) < 60 and cached_index_date == date_msk and isinstance(cached_index, list):
+        out_map = {}
         for k, v in cached.items():
             d, h, a = k.split("|", 2)
-            out[(d, h, a)] = v
-        return out
+            out_map[(d, h, a)] = v
+        return out_map, cached_index
 
     participants = get_participants_map(force=False)
     tourn_map = resolve_target_tournament_ids(force=False)
@@ -553,7 +557,9 @@ def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, st
 
     items = fetch_oddspapi_odds_by_tournaments(tourn_ids)
 
-    m: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    out_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    out_index: List[Dict[str, Any]] = []
+
     for it in items:
         start = it.get("startTime")
         p1 = it.get("participant1Id")
@@ -576,22 +582,72 @@ def build_oddspapi_fixture_map_for_day(date_msk: str) -> Dict[Tuple[str, str, st
         if not t1 or not t2:
             continue
 
-        k1 = safe_team_key(t1)
-        k2 = safe_team_key(t2)
+        hk = safe_team_key(t1)
+        ak = safe_team_key(t2)
+        ts_msk = int(dt_msk.timestamp())
 
-        m[(d_msk, k1, k2)] = it
-        m[(d_msk, k2, k1)] = it
+        out_map[(d_msk, hk, ak)] = it
+        out_map[(d_msk, ak, hk)] = it
+
+        out_index.append({"d": d_msk, "h": hk, "a": ak, "ts": ts_msk, "item": it})
 
     compact = {}
-    for (d, h, a), v in m.items():
+    for (d, h, a), v in out_map.items():
         compact[f"{d}|{h}|{a}"] = v
 
     STATE[ODDS_CACHE_KEY] = compact
     STATE[ODDS_CACHE_DATE] = date_msk
     STATE[ODDS_CACHE_TS] = time.time()
+    STATE[ODDS_INDEX_KEY] = out_index
+    STATE[ODDS_INDEX_DATE] = date_msk
     save_state(STATE)
 
-    return m
+    return out_map, out_index
+
+def match_odds_for_fixture(date_msk: str, fixture_ts_msk: int, home_name: str, away_name: str,
+                           odds_map: Dict[Tuple[str, str, str], Dict[str, Any]],
+                           odds_index: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    1) Прямой матч по ключу
+    2) Fuzzy матч по времени (±2 часа) + схожести токенов
+    """
+    hk = safe_team_key(home_name)
+    ak = safe_team_key(away_name)
+
+    direct = odds_map.get((date_msk, hk, ak))
+    if direct:
+        return direct
+
+    # fuzzy
+    ht = tokens(home_name)
+    at = tokens(away_name)
+    best = None
+    best_score = 0.0
+
+    for row in odds_index:
+        if row.get("d") != date_msk:
+            continue
+        ts = int(row.get("ts") or 0)
+        if abs(ts - fixture_ts_msk) > 2 * 3600:
+            continue
+
+        # сравнение имени дома/гостей
+        s1 = jaccard(ht, set(row["h"].split()))
+        s2 = jaccard(at, set(row["a"].split()))
+        score = (s1 + s2) / 2.0
+
+        # небольшой бонус за близкое время
+        score += max(0.0, 0.15 - abs(ts - fixture_ts_msk) / (2 * 3600) * 0.15)
+
+        if score > best_score:
+            best_score = score
+            best = row["item"]
+
+    # порог схожести
+    if best and best_score >= 0.45:
+        return best
+
+    return None
 
 # =====================================================
 # Telegram commands
@@ -603,7 +659,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /signals — value-сигналы (P≥75% и Value>0)\n"
         "• /all — все матчи (P + odds)\n"
         "• /check — диагностика odds\n"
-        "• /odds_debug — сырой outcomeId/price\n"
+        "• /odds_debug — покажет RAW outcomeId/price для реально сматченного матча\n"
         "• /oddspapi_account — проверка ключа\n"
         "• /reload_leagues — пересканировать лиги\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
@@ -641,7 +697,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+        odds_map, odds_index = build_oddspapi_for_day(used_date)
     except Exception as e:
         await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
         return
@@ -650,9 +706,14 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     matched, with_markets = 0, 0
 
     for f in sample:
+        fixture = f.get("fixture") or {}
+        ts = int(fixture.get("timestamp") or 0)
+        ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp()) if ts else 0
+
         home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
         away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-        it = odds_map.get((used_date, safe_team_key(home), safe_team_key(away)))
+
+        it = match_odds_for_fixture(used_date, ts_msk, home, away, odds_map, odds_index)
         if it:
             matched += 1
             odds = parse_book_odds_from_oddspapi_item(it)
@@ -676,27 +737,43 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+        odds_map, odds_index = build_oddspapi_for_day(used_date)
     except Exception as e:
         await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
         return
 
-    f = fixtures[0]
-    home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-    away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
+    # ИЩЕМ ПЕРВЫЙ СМАТЧЕННЫЙ МАТЧ (а не "первый матч дня")
+    matched_fixture = None
+    matched_item = None
 
-    it = odds_map.get((used_date, safe_team_key(home), safe_team_key(away)))
-    if not it:
-        await update.message.reply_text("❌ Не сматчился первый матч дня (по названиям команд).")
+    for f in fixtures:
+        fixture = f.get("fixture") or {}
+        ts = int(fixture.get("timestamp") or 0)
+        ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp()) if ts else 0
+
+        home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
+        away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
+
+        it = match_odds_for_fixture(used_date, ts_msk, home, away, odds_map, odds_index)
+        if it:
+            matched_fixture = f
+            matched_item = it
+            break
+
+    if not matched_item:
+        await update.message.reply_text("❌ Не нашёл ни одного сматченного матча для odds_debug (пока).")
         return
 
-    bm = ((it.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
+    home = ((matched_fixture.get("teams") or {}).get("home") or {}).get("name", "")
+    away = ((matched_fixture.get("teams") or {}).get("away") or {}).get("name", "")
+
+    bm = ((matched_item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
     markets = bm.get("markets") or {}
 
     lines = [
         f"🧪 ODDS DEBUG ({used_date})\n{home} — {away}\nBookmaker: {ODDSPAPI_BOOKMAKER}\n",
-        f"fixtureId: {it.get('fixtureId')}\nstartTime: {it.get('startTime')}\nmarkets: {len(markets)}\n\n",
-        "RAW sample (до 60 строк):\n",
+        f"fixtureId: {matched_item.get('fixtureId')}\nstartTime: {matched_item.get('startTime')}\nmarkets: {len(markets)}\n\n",
+        "RAW sample (до 80 строк):\n",
     ]
 
     shown = 0
@@ -711,86 +788,13 @@ async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             lines.append(f"m={mid} o={oid} outcome={bok} price={price}\n")
             shown += 1
-            if shown >= 60:
+            if shown >= 80:
                 break
-        if shown >= 60:
+        if shown >= 80:
             break
 
     for part in chunked("".join(lines)):
         await update.message.reply_text(part)
-
-async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures, _, _, used_date = get_today_matches_filtered()
-    if not fixtures:
-        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет.")
-        return
-
-    try:
-        odds_map = build_oddspapi_fixture_map_for_day(used_date)
-    except Exception as e:
-        await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
-        return
-
-    out = [f"📋 ALL ({used_date}) — Book: {ODDSPAPI_BOOKMAKER}\n\n"]
-    sent = 0
-
-    for f in fixtures[:30]:
-        fixture = f.get("fixture") or {}
-        home = (f.get("teams") or {}).get("home", {}) or {}
-        away = (f.get("teams") or {}).get("away", {}) or {}
-        league = f.get("league", {}) or {}
-        venue = fixture.get("venue") or {}
-        city = venue.get("city")
-
-        home_id = home.get("id")
-        away_id = away.get("id")
-        if not home_id or not away_id:
-            continue
-
-        hs = analyze_goals(get_last_matches(int(home_id), last=5))
-        as_ = analyze_goals(get_last_matches(int(away_id), last=5))
-        if not hs or not as_:
-            continue
-
-        w_k = weather_factor(city)
-        p_o25 = prob_over25(hs, as_, w_k)
-        p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
-        p_btts_y = prob_btts_yes(hs, as_, w_k)
-        p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
-
-        ts = fixture.get("timestamp")
-        t_str = "—"
-        if ts:
-            time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
-            t_str = time_msk.strftime("%H:%M МСК")
-
-        it = odds_map.get((used_date, safe_team_key(home.get("name", "")), safe_team_key(away.get("name", ""))))
-        odds = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
-        if it:
-            odds = parse_book_odds_from_oddspapi_item(it)
-
-        def line(title: str, p: float, book: Optional[float]) -> str:
-            if book is None:
-                return f"{title}: P={int(p*100)}% | Book=—"
-            v = value_ev(p, book)
-            return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
-
-        out.append(
-            f"🏆 {league.get('name','?')}\n"
-            f"{home.get('name','?')} — {away.get('name','?')} | 🕒 {t_str}\n"
-            f"{line('ТБ2.5', p_o25, odds['O25'])}\n"
-            f"{line('ТМ2.5', p_u25, odds['U25'])}\n"
-            f"{line('ОЗ Да', p_btts_y, odds['BTTS_Y'])}\n"
-            f"{line('ОЗ Нет', p_btts_n, odds['BTTS_N'])}\n\n"
-        )
-
-        sent += 1
-        if sent % 6 == 0:
-            await update.message.reply_text("".join(out))
-            out = ["(продолжение)\n\n"]
-
-    if out:
-        await update.message.reply_text("".join(out))
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -799,7 +803,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        odds_map = build_oddspapi_fixture_map_for_day(used_date)
+        odds_map, odds_index = build_oddspapi_for_day(used_date)
     except Exception as e:
         await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
         return
@@ -821,7 +825,13 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not home_id or not away_id:
             continue
 
-        it = odds_map.get((used_date, safe_team_key(home.get("name", "")), safe_team_key(away.get("name", ""))))
+        ts = int(fixture.get("timestamp") or 0)
+        if not ts:
+            continue
+        ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp())
+        t_str = (datetime.utcfromtimestamp(ts) + timedelta(hours=3)).strftime("%H:%M МСК")
+
+        it = match_odds_for_fixture(used_date, ts_msk, home.get("name", ""), away.get("name", ""), odds_map, odds_index)
         if not it:
             continue
 
@@ -839,12 +849,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
         p_btts_y = prob_btts_yes(hs, as_, w_k)
         p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
-
-        ts = fixture.get("timestamp")
-        t_str = "—"
-        if ts:
-            time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
-            t_str = time_msk.strftime("%H:%M МСК")
 
         def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
             if book is None:
@@ -888,14 +892,22 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📭 На дату {used_date} нет value-сигналов при порогах:\n"
             f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n\n"
-            "Проверка:\n"
-            "• /check\n"
-            "• /odds_debug (посмотреть реальные outcomeId)\n"
+            "Следующий шаг: /odds_debug\n"
+            "Он покажет реальные outcomeId у 1xBet — по ним мы точно настроим парсер.\n"
         )
         return
 
     if out:
         await update.message.reply_text("".join(out))
+
+async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fixtures, _, _, used_date = get_today_matches_filtered()
+    if not fixtures:
+        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет.")
+        return
+
+    await update.message.reply_text(f"📋 Матчей (после фильтра лиг) на {used_date}: {len(fixtures)}\n"
+                                    f"Проверь /signals и /check")
 
 # =====================================================
 # RUN
