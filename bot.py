@@ -1,10 +1,14 @@
 import os
 import json
 import requests
+import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 
+# ======================
+# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
@@ -186,7 +190,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ======================
-# ОТЛАДОЧНЫЕ СИГНАЛЫ — ВЫВОД ВСЕХ МАТЧЕЙ
+# ОТЛАДОЧНЫЕ СИГНАЛЫ
 # ======================
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures = get_today_matches()
@@ -233,17 +237,24 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
 # ======================
 # ЗАПУСК
 # ======================
-def main():
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Добавляем команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
 
-    # Планируем фоновое обновление каждый день в 03:00 UTC
-    job_queue: JobQueue = app.job_queue
-    job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
+    # Инициализация job_queue перед использованием
+    await app.initialize()
 
-    app.run_polling()
+    # Ежедневное обновление судей в 03:00 UTC
+    app.job_queue.run_daily(daily_ref_update, time=time(hour=3, minute=0))
+
+    # Запуск бота
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
+
 
