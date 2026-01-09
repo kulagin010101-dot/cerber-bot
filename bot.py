@@ -13,7 +13,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
-DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # канал/чат для отправки (опционально)
+DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # опционально: канал/чат для отправки
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
@@ -28,13 +28,11 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 REF_FILE = "referees.json"
 STATE_FILE = "state.json"
 
-# Лиги: можно расширить позже, но для отладки можно оставить все матчи дня
-# LEAGUES = {39:"EPL",140:"LaLiga",135:"SerieA",78:"Bundesliga",235:"RPL"}
-
-TEAM_IDS_FOR_REF_UPDATE = [39, 140, 135, 78, 235]  # как раньше (ограниченно)
+# Для автообновления судей (ограниченно)
+TEAM_IDS_FOR_REF_UPDATE = [39, 140, 135, 78, 235]
 
 # ======================
-# STATE (чтобы обновлять судей раз в сутки)
+# STATE
 # ======================
 def load_state() -> Dict[str, Any]:
     if os.path.exists(STATE_FILE):
@@ -76,36 +74,31 @@ def referee_factor(name: Optional[str]) -> float:
     if not ref:
         return 1.0
     pen = float(ref.get("penalties_per_game", 0))
-    # мягкая корректировка
     if pen >= 0.30:
         return 1.07
     if pen <= 0.18:
         return 0.94
     return 1.0
 
-def fetch_team_fixtures(team_id: int, last: int = 20) -> list:
+def fetch_team_fixtures(team_id: int, last: int = 25) -> list:
     try:
         r = requests.get(
             "https://v3.football.api-sports.io/fixtures",
             headers=HEADERS,
             params={"team": team_id, "last": last, "season": SEASON},
-            timeout=20
+            timeout=25
         )
         r.raise_for_status()
         data = r.json()
+        if data.get("errors"):
+            print("[API errors]", data["errors"])
         return data.get("response", [])
     except Exception as e:
         print(f"[ERROR] fetch_team_fixtures team={team_id}: {e}")
         return []
 
 def update_referees_from_recent_matches() -> int:
-    """
-    Обновляет REFEREES на основе последних матчей команд из TEAM_IDS_FOR_REF_UPDATE.
-    Возвращает число обновлённых/добавленных судей.
-    """
     updated = 0
-
-    # локальные аккумуляторы
     agg: Dict[str, Dict[str, float]] = {}
 
     for tid in TEAM_IDS_FOR_REF_UPDATE:
@@ -121,8 +114,7 @@ def update_referees_from_recent_matches() -> int:
                 continue
             total_goals = float(h + a)
 
-            # В API-Football пенальти в events не всегда доступны в fixtures list,
-            # поэтому делаем максимально безопасно: если events нет — пенальти=0 (консервативно).
+            # events иногда не приходят в списке fixtures -> считаем консервативно
             penalties = 0
             for ev in f.get("events", []) or []:
                 if ev.get("type") == "Penalty":
@@ -144,17 +136,20 @@ def update_referees_from_recent_matches() -> int:
 
         old = REFEREES.get(ref)
         if not old:
-            REFEREES[ref] = {"penalties_per_game": round(new_pen, 3), "avg_goals": round(new_avg_goals, 3)}
+            REFEREES[ref] = {
+                "penalties_per_game": round(new_pen, 3),
+                "avg_goals": round(new_avg_goals, 3)
+            }
             updated += 1
         else:
-            # сглаживание, чтобы база не “прыгала”
             old_pen = float(old.get("penalties_per_game", 0))
             old_avg = float(old.get("avg_goals", 0))
-
             blended_pen = 0.7 * old_pen + 0.3 * new_pen
             blended_avg = 0.7 * old_avg + 0.3 * new_avg_goals
-
-            REFEREES[ref] = {"penalties_per_game": round(blended_pen, 3), "avg_goals": round(blended_avg, 3)}
+            REFEREES[ref] = {
+                "penalties_per_game": round(blended_pen, 3),
+                "avg_goals": round(blended_avg, 3)
+            }
             updated += 1
 
     if updated:
@@ -163,13 +158,8 @@ def update_referees_from_recent_matches() -> int:
     return updated
 
 def ensure_daily_referee_update() -> None:
-    """
-    Обновляем судей максимум раз в сутки, чтобы не упираться в лимиты API.
-    """
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    last = STATE.get("ref_update_date")
-
-    if last == today:
+    if STATE.get("ref_update_date") == today:
         return
 
     print(f"[INFO] Daily referee update started for {today} ...")
@@ -222,10 +212,12 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
             "https://v3.football.api-sports.io/fixtures",
             headers=HEADERS,
             params={"team": team_id, "last": last, "season": SEASON},
-            timeout=20
+            timeout=25
         )
         r.raise_for_status()
         data = r.json()
+        if data.get("errors"):
+            print("[API errors]", data["errors"])
         return data.get("response", [])
     except Exception as e:
         print(f"[ERROR] get_last_matches team={team_id}: {e}")
@@ -261,7 +253,6 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
     }
 
 def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float, r_k: float) -> float:
-    # базовая оценка
     prob = 0.60
     base = (hs["avg"] + as_["avg"]) / 2.0
 
@@ -280,30 +271,53 @@ def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float, r_
     return min(max(prob, 0.05), 0.90)
 
 # ======================
-# TODAY FIXTURES
+# TODAY FIXTURES (FIXED)
 # ======================
 def get_today_matches() -> list:
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    try:
+    def fetch(date_str: str, use_season: bool) -> list:
+        params = {"date": date_str}
+        if use_season:
+            params["season"] = SEASON
+
         r = requests.get(
             "https://v3.football.api-sports.io/fixtures",
             headers=HEADERS,
-            params={"date": today, "season": SEASON},
+            params=params,
             timeout=25
         )
         r.raise_for_status()
         data = r.json()
+        if data.get("errors"):
+            print("[API errors]", data["errors"])
         return data.get("response", [])
-    except Exception as e:
-        print(f"[ERROR] get_today_matches: {e}")
-        return []
+
+    date_utc = datetime.utcnow().strftime("%Y-%m-%d")
+    date_msk = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
+
+    for date_str in [date_msk, date_utc]:
+        try:
+            matches = fetch(date_str, use_season=True)
+            if matches:
+                print(f"[INFO] Fixtures found for {date_str} with season={SEASON}: {len(matches)}")
+                return matches
+        except Exception as e:
+            print(f"[ERROR] fixtures date={date_str} season={SEASON}: {e}")
+
+        try:
+            matches = fetch(date_str, use_season=False)
+            if matches:
+                print(f"[INFO] Fixtures found for {date_str} without season: {len(matches)}")
+                return matches
+        except Exception as e:
+            print(f"[ERROR] fixtures date={date_str} no season: {e}")
+
+    print(f"[INFO] No fixtures found. UTC={date_utc}, MSK={date_msk}, season={SEASON}")
+    return []
 
 # ======================
 # TELEGRAM HELPERS
 # ======================
 def target_chat_id(update: Update) -> str:
-    # если задан TELEGRAM_CHAT_ID — шлём туда (канал),
-    # иначе — отвечаем туда, откуда пришла команда.
     return DEFAULT_CHAT_ID or str(update.effective_chat.id)
 
 # ======================
@@ -313,7 +327,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР (рынок ГОЛОВ)\n\n"
         "Команды:\n"
-        "• /signals — показать матчи дня и вероятность ТБ2.5 (отладка)\n"
+        "• /signals — матчи дня + вероятность ТБ2.5 (отладка)\n"
         "• /update_refs — принудительно обновить базу судей\n\n"
         f"Порог сигналов: {int(MIN_PROB*100)}%"
     )
@@ -333,21 +347,28 @@ async def update_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
 
-    # 1) раз в сутки обновляем судей
+    # диагностические даты
+    print("[INFO] SEASON =", SEASON)
+    print("[INFO] UTC date =", datetime.utcnow().strftime("%Y-%m-%d"))
+    print("[INFO] MSK date =", (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d"))
+
+    # раз в сутки обновляем судей (не обязательно, но пусть будет)
     try:
         ensure_daily_referee_update()
     except Exception as e:
-        # не падаем — просто логируем
         print(f"[ERROR] ensure_daily_referee_update: {e}")
 
     fixtures = get_today_matches()
     if not fixtures:
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Сегодня матчей не найдено в API.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Сегодня матчей не найдено в API.\n"
+                 "Смотри логи Railway: там будут даты UTC/MSK и возможные API errors."
+        )
         return
 
-    # Отладочный вывод: ВСЕ матчи + вероятность ТБ2.5
     msg_parts = ["⚽ ЦЕРБЕР — матчи дня (вероятность ТБ 2.5)\n"]
-    count_lines = 0
+    chunk = 0
 
     for f in fixtures:
         home = f.get("teams", {}).get("home", {})
@@ -370,7 +391,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r_k = referee_factor(referee)
         prob = calc_prob_over25(hs, as_, w_k, r_k)
 
-        # время МСК
         ts = f.get("fixture", {}).get("timestamp")
         if ts:
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
@@ -378,22 +398,17 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             t_str = "—"
 
-        line = (
+        msg_parts.append(
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
-            f"ТБ2.5: {int(prob*100)}%\n"
+            f"ТБ2.5: {int(prob*100)}%\n\n"
         )
 
-        # чтобы не упереться в лимит телеги, бьём на куски
-        msg_parts.append(line)
-        msg_parts.append("\n")
-        count_lines += 1
-
-        if count_lines % 12 == 0:
+        chunk += 1
+        if chunk % 12 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
             msg_parts = ["(продолжение)\n\n"]
 
-    # отправляем хвост
     if msg_parts:
         await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
 
