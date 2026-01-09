@@ -4,7 +4,7 @@ import requests
 import asyncio
 from datetime import datetime, timedelta, time
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ======================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -21,7 +21,7 @@ REF_FILE = "referees.json"
 TEAM_IDS = [39, 140, 135, 78, 235]  # Англия, Испания, Италия, Германия, Россия
 
 # ======================
-# ЗАГРУЗКА/СОХРАНЕНИЕ СУДЕЙ
+# СУДЬИ
 # ======================
 if os.path.exists(REF_FILE):
     with open(REF_FILE, "r", encoding="utf-8") as f:
@@ -43,9 +43,6 @@ def referee_factor(name):
         return 0.94
     return 1.0
 
-# ======================
-# ОБНОВЛЕНИЕ СУДЕЙ
-# ======================
 def fetch_team_fixtures(team_id, last=20):
     try:
         r = requests.get(
@@ -190,7 +187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ======================
-# ОТЛАДОЧНЫЕ СИГНАЛЫ
+# ОТЛАДКА СИГНАЛОВ
 # ======================
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures = get_today_matches()
@@ -240,11 +237,10 @@ async def daily_ref_update(context: ContextTypes.DEFAULT_TYPE):
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Добавляем команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
 
-    # Инициализация job_queue перед использованием
+    # Асинхронная инициализация (job_queue будет создан)
     await app.initialize()
 
     # Ежедневное обновление судей в 03:00 UTC
@@ -254,7 +250,4 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
-
-
