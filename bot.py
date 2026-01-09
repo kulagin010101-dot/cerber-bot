@@ -4,12 +4,9 @@ from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ======================
-# НАСТРОЙКИ
-# ======================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("FOOTBALL_API_KEY")
+WEATHER_KEY = os.getenv("WEATHER_API_KEY")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_PROB = 0.75
@@ -26,78 +23,107 @@ LEAGUES = {
 HEADERS = {"x-apisports-key": API_KEY}
 
 # ======================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ПОГОДА
+# ======================
+
+def weather_factor(city):
+    if not WEATHER_KEY or not city:
+        return 1.0
+    try:
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={
+                "q": city,
+                "appid": WEATHER_KEY,
+                "units": "metric"
+            },
+            timeout=10
+        ).json()
+
+        temp = r["main"]["temp"]
+        rain = r.get("rain", {}).get("1h", 0)
+        wind = r["wind"]["speed"]
+
+        factor = 1.0
+
+        if temp < 5 or temp > 28:
+            factor *= 0.95
+        if rain > 0:
+            factor *= 0.95
+        if wind > 8:
+            factor *= 0.96
+
+        return factor
+    except:
+        return 1.0
+
+# ======================
+# СТАТИСТИКА ГОЛОВ
 # ======================
 
 def get_last_matches(team_id, limit=5):
-    url = f"https://v3.football.api-sports.io/fixtures"
-    params = {
-        "team": team_id,
-        "last": limit,
-        "season": SEASON
-    }
-    r = requests.get(url, headers=HEADERS, params=params, timeout=15).json()
+    r = requests.get(
+        "https://v3.football.api-sports.io/fixtures",
+        headers=HEADERS,
+        params={"team": team_id, "last": limit, "season": SEASON},
+        timeout=15
+    ).json()
     return r.get("response", [])
 
 def analyze_goals(matches):
-    total_goals = 0
-    btts_yes = 0
-    over_25 = 0
+    total, btts, over = 0, 0, 0
 
     for m in matches:
-        g_home = m["goals"]["home"]
-        g_away = m["goals"]["away"]
-        if g_home is None or g_away is None:
+        h, a = m["goals"]["home"], m["goals"]["away"]
+        if h is None or a is None:
             continue
-
-        total_goals += g_home + g_away
-
-        if g_home > 0 and g_away > 0:
-            btts_yes += 1
-        if g_home + g_away > 2:
-            over_25 += 1
+        total += h + a
+        if h > 0 and a > 0:
+            btts += 1
+        if h + a > 2:
+            over += 1
 
     played = len(matches)
     if played == 0:
         return None
 
     return {
-        "avg_goals": total_goals / played,
-        "btts_rate": btts_yes / played,
-        "over25_rate": over_25 / played
+        "avg": total / played,
+        "btts": btts / played,
+        "over25": over / played
     }
 
-def calculate_probability(home_stats, away_stats):
-    base = (home_stats["avg_goals"] + away_stats["avg_goals"]) / 2
-
+def calculate_probability(home, away, weather_k):
+    base = (home["avg"] + away["avg"]) / 2
     prob = 0.60
+
     if base >= 2.6:
         prob += 0.08
-    if home_stats["over25_rate"] >= 0.6:
+    if home["over25"] >= 0.6:
         prob += 0.05
-    if away_stats["over25_rate"] >= 0.6:
+    if away["over25"] >= 0.6:
         prob += 0.05
-    if home_stats["btts_rate"] >= 0.6 and away_stats["btts_rate"] >= 0.6:
+    if home["btts"] >= 0.6 and away["btts"] >= 0.6:
         prob += 0.04
 
+    prob *= weather_k
     return min(prob, 0.88)
 
 # ======================
-# МАТЧИ СЕГОДНЯ
+# МАТЧИ
 # ======================
 
 def get_today_matches():
     today = datetime.utcnow().strftime("%Y-%m-%d")
     fixtures = []
 
-    for league_id in LEAGUES:
-        url = "https://v3.football.api-sports.io/fixtures"
-        params = {
-            "date": today,
-            "league": league_id,
-            "season": SEASON
-        }
-        r = requests.get(url, headers=HEADERS, params=params, timeout=15).json()
+    for league in LEAGUES:
+        r = requests.get(
+            "https://v3.football.api-sports.io/fixtures",
+            headers=HEADERS,
+            params={"date": today, "league": league, "season": SEASON},
+            timeout=15
+        ).json()
         fixtures.extend(r.get("response", []))
 
     return fixtures
@@ -108,39 +134,35 @@ def get_today_matches():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — рынок ГОЛОВ\n\n"
-        "Я анализирую:\n"
-        "• ТБ / ТМ 2.5\n"
-        "• Обе забьют\n"
-        "• Индивидуальные тоталы\n\n"
+        "🐺 ЦЕРБЕР — рынок ГОЛОВ\n"
+        "Факторы: форма + погода\n\n"
         "Сигналы: /signals"
     )
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures = get_today_matches()
-    message = "⚽ СИГНАЛЫ ЦЕРБЕРА (ГОЛЫ)\n\n"
+    msg = "⚽ СИГНАЛЫ ЦЕРБЕРА (ГОЛЫ)\n\n"
     found = False
 
     for f in fixtures:
         home = f["teams"]["home"]
         away = f["teams"]["away"]
+        city = f["fixture"]["venue"]["city"]
 
-        home_matches = get_last_matches(home["id"])
-        away_matches = get_last_matches(away["id"])
+        hs = analyze_goals(get_last_matches(home["id"]))
+        as_ = analyze_goals(get_last_matches(away["id"]))
 
-        home_stats = analyze_goals(home_matches)
-        away_stats = analyze_goals(away_matches)
-
-        if not home_stats or not away_stats:
+        if not hs or not as_:
             continue
 
-        prob = calculate_probability(home_stats, away_stats)
+        weather_k = weather_factor(city)
+        prob = calculate_probability(hs, as_, weather_k)
 
         if prob >= MIN_PROB:
             found = True
             time_msk = datetime.utcfromtimestamp(f["fixture"]["timestamp"]) + timedelta(hours=3)
 
-            message += (
+            msg += (
                 f"{home['name']} — {away['name']}\n"
                 f"🕒 {time_msk.strftime('%H:%M МСК')}\n"
                 f"📊 ТБ 2.5\n"
@@ -148,9 +170,9 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     if not found:
-        message = "Сегодня нет value-сигналов от 75% 🐺"
+        msg = "Сегодня нет value-сигналов от 75% 🐺"
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=message)
+    await context.bot.send_message(chat_id=CHAT_ID, text=msg)
 
 # ======================
 # ЗАПУСК
@@ -164,5 +186,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
