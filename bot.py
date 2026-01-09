@@ -27,8 +27,12 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 
 STATE_FILE = "state.json"
 
+# Название рынка в API-Football для O/U 2.5 — иногда может отличаться.
+# Оставляю дефолт, но если надо — можно переопределить переменной окружения.
+ODDS_MARKET_OVER25 = os.getenv("ODDS_MARKET_OVER25", "Over/Under 2.5")
+
 # ======================
-# TARGET COMPETITIONS + ALIASES
+# TARGET COMPETITIONS + ALIASES (умный поиск)
 # ======================
 TARGET_COMPETITIONS: List[Dict[str, Any]] = [
     # England
@@ -38,7 +42,7 @@ TARGET_COMPETITIONS: List[Dict[str, Any]] = [
     {"country": "England", "name": "Community Shield", "aliases": ["Community Shield", "FA Community Shield"]},
 
     # Germany
-    {"country": "Germany", "name": "Bundesliga", "aliases": ["Bundesliga", "Bundesliga 1", "1. Bundesliga"]},
+    {"country": "Germany", "name": "Bundesliga", "aliases": ["Bundesliga", "Bundesliga 1", "1. Bundesliga", "Bundesliga - 1"]},
     {"country": "Germany", "name": "DFB Pokal", "aliases": ["DFB Pokal", "DFB-Pokal", "German Cup"]},
     {"country": "Germany", "name": "Super Cup", "aliases": ["Super Cup", "DFL Supercup", "German Super Cup"]},
 
@@ -84,7 +88,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # ======================
-# WEATHER (опционально)
+# WEATHER
 # ======================
 def weather_factor(city: Optional[str]) -> float:
     if not WEATHER_KEY or not city:
@@ -178,6 +182,58 @@ def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) ->
     return min(max(prob, 0.05), 0.90)
 
 # ======================
+# ODDS (BEST COEF)
+# ======================
+def fetch_fixture_odds(fixture_id: int) -> list:
+    try:
+        r = requests.get(
+            "https://v3.football.api-sports.io/odds",
+            headers=HEADERS,
+            params={"fixture": fixture_id},
+            timeout=25
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("errors"):
+            print("[API odds errors]", data["errors"])
+        return data.get("response", []) or []
+    except Exception as e:
+        print(f"[ERROR] fetch_fixture_odds fixture={fixture_id}: {e}")
+        return []
+
+def extract_best_over25_odds(odds_response: list) -> Optional[float]:
+    """
+    Лучший (максимальный) коэффициент на Over 2.5 среди всех букмекеров.
+    """
+    if not odds_response:
+        return None
+
+    best = None
+    market_name = ODDS_MARKET_OVER25.strip().lower()
+
+    for item in odds_response:
+        for bm in (item.get("bookmakers") or []):
+            for b in (bm.get("bets") or []):
+                bet_name = (b.get("name") or "").strip().lower()
+                if bet_name != market_name:
+                    continue
+
+                for v in (b.get("values") or []):
+                    label = (v.get("value") or "").strip().lower()
+                    odd_str = v.get("odd")
+                    try:
+                        odd = float(odd_str)
+                    except:
+                        continue
+
+                    # варианты подписей
+                    if label in ["over 2.5", "over2.5", "o2.5", "over"]:
+                        if best is None or odd > best:
+                            best = odd
+
+    return best
+
+# ======================
 # LEAGUES LOOKUP (SMART)
 # ======================
 def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
@@ -195,18 +251,15 @@ def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, A
     return data.get("response", [])
 
 def score_candidate(target_country: Optional[str], aliases: List[str], cand_name: str, cand_country: str) -> int:
-    """
-    Чем больше score — тем лучше.
-    """
     tn = cand_name.strip().lower()
     tc = cand_country.strip().lower()
-
     score = 0
+
     if target_country:
         if tc == target_country.strip().lower():
             score += 50
         else:
-            score -= 10  # лёгкий штраф
+            score -= 10
 
     for a in aliases:
         al = a.strip().lower()
@@ -241,7 +294,6 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
         best_score = -999999
         best_debug = None
 
-        # Пробуем по всем алиасам; сначала с country, потом без country
         for alias in aliases:
             for ctry in [country, None]:
                 try:
@@ -255,7 +307,6 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
                     cn = rr.get("country", {}) or {}
                     cand_name = (lg.get("name") or "").strip()
                     cand_country = (cn.get("name") or "").strip()
-
                     if not cand_name:
                         continue
 
@@ -280,7 +331,7 @@ def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List
     return resolved, missing
 
 # ======================
-# FIXTURES (filter by league ids)
+# FIXTURES FILTERED
 # ======================
 def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
     params = {"date": date_str}
@@ -310,7 +361,6 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
                 fixtures = fetch_fixtures_by_date(date_str, use_season=use_season)
                 if fixtures:
                     filtered = [f for f in fixtures if (f.get("league", {}) or {}).get("id") in allowed_ids]
-                    print(f"[INFO] Fixtures {date_str} use_season={use_season}: total={len(fixtures)} filtered={len(filtered)}")
                     if filtered:
                         return filtered, league_ids, missing, date_str
             except Exception as e:
@@ -340,12 +390,11 @@ def chunked(text: str, limit: int = 3500) -> List[str]:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР — фильтр турниров включён.\n\n"
+        "🐺 ЦЕРБЕР — odds включены (беру ЛУЧШИЙ коэф среди букмекеров).\n\n"
         "Команды:\n"
-        "• /signals — матчи дня только по выбранным турнирам\n"
-        "• /reload_leagues — пересканировать турниры (покажет найдено/не найдено)\n"
-        "• /debug_league <страна|UEFA> <поиск> — показать как API называет турнир\n\n"
-        "Пример: /debug_league Spain liga"
+        "• /signals — матчи по выбранным турнирам + вероятность + лучший коэф + value\n"
+        "• /reload_leagues — пересканировать турниры\n"
+        "• /debug_league <страна|UEFA> <поиск>\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,26 +421,19 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=part)
 
 async def debug_league(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /debug_league Spain liga
-    /debug_league Germany bundes
-    /debug_league UEFA champions
-    """
     chat_id = target_chat_id(update)
     args = context.args
-
     if len(args) < 2:
         await context.bot.send_message(chat_id=chat_id, text="Используй: /debug_league <страна|UEFA> <поиск>")
         return
 
     c = args[0]
     q = " ".join(args[1:]).strip()
-
     country = None if c.strip().upper() == "UEFA" else c.strip()
 
     try:
         res1 = leagues_search(q, country)
-        res2 = [] if country is None else leagues_search(q, None)  # без country как доказательство
+        res2 = [] if country is None else leagues_search(q, None)
         combined = res1 + res2
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"Ошибка поиска лиг: {e}")
@@ -434,20 +476,21 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"В кэше турниров: {len(league_ids)}\n"
         if missing:
             msg += "\n❌ Не найдены турниры:\n" + "\n".join(f"• {m}" for m in missing)
-        msg += "\n\nПопробуй: /reload_leagues\nИли проверь названия через /debug_league"
+        msg += "\n\nПопробуй: /reload_leagues"
         await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
-    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\n\n"]
+    out = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nOdds: лучший коэф на ТБ2.5\n\n"]
     count = 0
 
     for f in fixtures:
-        home = f.get("teams", {}).get("home", {}) or {}
-        away = f.get("teams", {}).get("away", {}) or {}
+        fixture_id = (f.get("fixture") or {}).get("id")
+        home = (f.get("teams") or {}).get("home", {}) or {}
+        away = (f.get("teams") or {}).get("away", {}) or {}
         league = f.get("league", {}) or {}
         league_name = league.get("name", "?")
 
-        venue = f.get("fixture", {}).get("venue", {}) or {}
+        venue = (f.get("fixture") or {}).get("venue", {}) or {}
         city = venue.get("city")
 
         home_id = home.get("id")
@@ -462,21 +505,36 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         prob = calc_prob_over25(hs, as_, weather_factor(city))
 
-        ts = f.get("fixture", {}).get("timestamp")
+        ts = (f.get("fixture") or {}).get("timestamp")
         t_str = "—"
         if ts:
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
 
+        # ODDS
+        best_odds = None
+        if fixture_id:
+            odds_resp = fetch_fixture_odds(int(fixture_id))
+            best_odds = extract_best_over25_odds(odds_resp)
+
+        fair = round(1.0 / prob, 2) if prob > 0 else None
+
+        if best_odds:
+            value = (prob * best_odds) - 1.0
+            odds_line = f"Book(best): {best_odds:.2f} | Fair: {fair:.2f} | Value: {value:+.2f}"
+        else:
+            odds_line = f"Book(best): нет линии | Fair: {fair:.2f}"
+
         out.append(
             f"🏆 {league_name}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
-            f"ТБ2.5: {int(prob*100)}%\n\n"
+            f"ТБ2.5: {int(prob*100)}%\n"
+            f"{odds_line}\n\n"
         )
 
         count += 1
-        if count % 10 == 0:
+        if count % 8 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(out))
             out = ["(продолжение)\n\n"]
 
