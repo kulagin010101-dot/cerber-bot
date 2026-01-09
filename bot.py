@@ -29,16 +29,14 @@ REF_FILE = "referees.json"
 STATE_FILE = "state.json"
 
 # ======================
-# ВЫБРАННЫЕ ТУРНИРЫ (как ты попросил)
-# ВАЖНО: названия должны совпадать с тем, как API их возвращает.
-# Если что-то не найдётся — мы увидим это в логах и быстро поправим.
+# TARGET COMPETITIONS
 # ======================
 TARGET_COMPETITIONS: List[Dict[str, Optional[str]]] = [
     # England
     {"country": "England", "name": "Premier League"},
     {"country": "England", "name": "FA Cup"},
     {"country": "England", "name": "League Cup"},
-    {"country": "England", "name": "Community Shield"},  # суперкубок
+    {"country": "England", "name": "Community Shield"},
 
     # Germany
     {"country": "Germany", "name": "Bundesliga"},
@@ -87,7 +85,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # ======================
-# REFEREES DB (оставил как было, но можно дальше улучшать)
+# REFEREES DB (оставлено как раньше; судья влияет только если есть в базе)
 # ======================
 def load_referees() -> Dict[str, Any]:
     if os.path.exists(REF_FILE):
@@ -215,41 +213,50 @@ def leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": name}
     if country:
         params["country"] = country
-    try:
-        r = requests.get(
-            "https://v3.football.api-sports.io/leagues",
-            headers=HEADERS,
-            params=params,
-            timeout=25
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data.get("response", [])
-    except Exception as e:
-        print(f"[ERROR] leagues_search name={name} country={country}: {e}")
-        return []
+    r = requests.get(
+        "https://v3.football.api-sports.io/leagues",
+        headers=HEADERS,
+        params=params,
+        timeout=25
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errors"):
+        print("[API errors]", data["errors"])
+    return data.get("response", [])
 
-def resolve_target_league_ids(force: bool = False) -> Dict[str, int]:
+def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List[str]]:
     """
-    Возвращает dict key->league_id, где key = f"{country or 'UEFA'}|{name}"
-    Кэшируется в state.json
+    Возвращает (resolved_ids, missing_keys)
+    key = f"{country or 'UEFA'}|{name}"
     """
     cache = STATE.get("league_ids", {})
     cache_date = STATE.get("league_ids_date")
 
     today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата
     if (not force) and cache and cache_date == today:
-        return {k: int(v) for k, v in cache.items()}
+        resolved = {k: int(v) for k, v in cache.items()}
+        missing = STATE.get("league_missing", [])
+        return resolved, missing
 
     resolved: Dict[str, int] = {}
+    missing: List[str] = []
+
     for item in TARGET_COMPETITIONS:
         country = item["country"]
         name = item["name"]
         key = f"{(country or 'UEFA')}|{name}"
 
-        results = leagues_search(name=name, country=country)
-        # Выбираем самый подходящий результат: точное совпадение имени (case-insensitive)
+        results = []
+        try:
+            results = leagues_search(name=name, country=country)
+        except Exception as e:
+            print(f"[ERROR] leagues_search {key}: {e}")
+            results = []
+
         best_id = None
+
+        # 1) точное совпадение названия
         for rr in results:
             lg = rr.get("league", {})
             nm = (lg.get("name") or "").strip()
@@ -257,7 +264,7 @@ def resolve_target_league_ids(force: bool = False) -> Dict[str, int]:
                 best_id = lg.get("id")
                 break
 
-        # если точного совпадения не нашли — берём первый (лучше чем ничего), но логируем
+        # 2) если нет точного — берём первый, но отметим это в логах
         if best_id is None and results:
             best_id = results[0].get("league", {}).get("id")
             got_name = (results[0].get("league", {}).get("name") or "?")
@@ -267,17 +274,19 @@ def resolve_target_league_ids(force: bool = False) -> Dict[str, int]:
         if best_id:
             resolved[key] = int(best_id)
         else:
-            print(f"[WARN] League not found in API: {key}")
+            missing.append(key)
+            print(f"[WARN] League not found: {key}")
 
     STATE["league_ids"] = {k: int(v) for k, v in resolved.items()}
     STATE["league_ids_date"] = today
+    STATE["league_missing"] = missing
     save_state(STATE)
 
-    print(f"[INFO] Resolved leagues: {resolved}")
-    return resolved
+    print(f"[INFO] Resolved leagues count={len(resolved)} missing={len(missing)}")
+    return resolved, missing
 
 # ======================
-# FIXTURES (с фильтром по league ids)
+# FIXTURES (filter by league ids)
 # ======================
 def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
     params = {"date": date_str}
@@ -296,11 +305,8 @@ def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
         print("[API errors]", data["errors"])
     return data.get("response", [])
 
-def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], str]:
-    """
-    Возвращает (fixtures_filtered, league_ids, used_date)
-    """
-    league_ids = resolve_target_league_ids(force=False)
+def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str], str]:
+    league_ids, missing = resolve_target_league_ids(force=False)
     allowed_ids = set(league_ids.values())
 
     date_utc = datetime.utcnow().strftime("%Y-%m-%d")
@@ -313,17 +319,16 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
                 if fixtures:
                     filtered = []
                     for f in fixtures:
-                        lg = f.get("league", {})
-                        lid = lg.get("id")
+                        lid = (f.get("league", {}) or {}).get("id")
                         if lid in allowed_ids:
                             filtered.append(f)
                     print(f"[INFO] Fixtures {date_str} use_season={use_season}: total={len(fixtures)} filtered={len(filtered)}")
                     if filtered:
-                        return filtered, league_ids, date_str
+                        return filtered, league_ids, missing, date_str
             except Exception as e:
                 print(f"[ERROR] fixtures date={date_str} use_season={use_season}: {e}")
 
-    return [], league_ids, date_msk
+    return [], league_ids, missing, date_msk
 
 # ======================
 # TELEGRAM HELPERS
@@ -331,36 +336,71 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
 def target_chat_id(update: Update) -> str:
     return DEFAULT_CHAT_ID or str(update.effective_chat.id)
 
+def chunked_send(text: str, limit: int = 3500) -> List[str]:
+    # Telegram limit ~4096, оставим запас
+    parts = []
+    buf = ""
+    for line in text.splitlines(True):
+        if len(buf) + len(line) > limit:
+            parts.append(buf)
+            buf = ""
+        buf += line
+    if buf:
+        parts.append(buf)
+    return parts
+
 # ======================
 # HANDLERS
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР (рынок ГОЛОВ) — фильтр по выбранным турнирам включён.\n\n"
+        "🐺 ЦЕРБЕР (рынок ГОЛОВ) — фильтр турниров включён.\n\n"
         "Команды:\n"
         "• /signals — матчи дня (только выбранные турниры) + вероятность ТБ2.5\n"
-        "• /reload_leagues — пересканировать ID турниров (если что-то не найдено)\n\n"
-        f"Порог: {int(MIN_PROB*100)}%"
+        "• /reload_leagues — пересканировать турниры и показать что найдено/не найдено\n"
     )
 
 async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
+
     await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры (league IDs)…")
-    ids = resolve_target_league_ids(force=True)
-    await context.bot.send_message(chat_id=chat_id, text=f"✅ Готово. Найдено турниров: {len(ids)}")
+    resolved, missing = resolve_target_league_ids(force=True)
+
+    lines = []
+    lines.append("✅ Найденные турниры:\n")
+    if resolved:
+        # сортируем красиво
+        for k in sorted(resolved.keys()):
+            lines.append(f"• {k} → ID {resolved[k]}\n")
+    else:
+        lines.append("• (пусто)\n")
+
+    lines.append("\n❌ Не найдены:\n")
+    if missing:
+        for k in missing:
+            lines.append(f"• {k}\n")
+    else:
+        lines.append("• (все найдены)\n")
+
+    text = "".join(lines)
+    for part in chunked_send(text):
+        await context.bot.send_message(chat_id=chat_id, text=part)
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
 
-    fixtures, league_ids, used_date = get_today_matches_filtered()
+    fixtures, league_ids, missing, used_date = get_today_matches_filtered()
     if not fixtures:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚠️ На дату {used_date} матчей по выбранным турнирам не найдено.\n"
-                "Если ты уверен, что матчи должны быть — напиши /reload_leagues (вдруг название турнира в API другое)."
-            )
+        msg = (
+            f"⚠️ На дату {used_date} матчей по выбранным турнирам не найдено.\n\n"
+            f"Сейчас в кэше турниров: {len(league_ids)}\n"
         )
+        if missing:
+            msg += "❌ Не найдены турниры:\n" + "\n".join(f"• {m}" for m in missing[:10])
+            if len(missing) > 10:
+                msg += f"\n…и ещё {len(missing)-10}"
+        msg += "\n\nПопробуй: /reload_leagues"
+        await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
     msg_parts = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nТолько выбранные турниры.\n\n"]
@@ -389,11 +429,10 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prob = calc_prob_over25(hs, as_, weather_factor(city), referee_factor(referee))
 
         ts = f.get("fixture", {}).get("timestamp")
+        t_str = "—"
         if ts:
             time_msk = datetime.utcfromtimestamp(int(ts)) + timedelta(hours=3)
             t_str = time_msk.strftime("%H:%M МСК")
-        else:
-            t_str = "—"
 
         msg_parts.append(
             f"🏆 {league_name}\n"
@@ -422,3 +461,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
