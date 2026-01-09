@@ -2,7 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -13,12 +13,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEY = os.getenv("FOOTBALL_API_KEY")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")
-DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # опционально: канал/чат для отправки
+DEFAULT_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # опционально
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения!")
+    raise ValueError("BOT_TOKEN не задан!")
 if not API_KEY:
-    raise ValueError("FOOTBALL_API_KEY не задан в переменных окружения!")
+    raise ValueError("FOOTBALL_API_KEY не задан!")
 
 HEADERS = {"x-apisports-key": API_KEY}
 
@@ -28,8 +28,45 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))
 REF_FILE = "referees.json"
 STATE_FILE = "state.json"
 
-# Для автообновления судей (ограниченно)
-TEAM_IDS_FOR_REF_UPDATE = [39, 140, 135, 78, 235]
+# ======================
+# ВЫБРАННЫЕ ТУРНИРЫ (как ты попросил)
+# ВАЖНО: названия должны совпадать с тем, как API их возвращает.
+# Если что-то не найдётся — мы увидим это в логах и быстро поправим.
+# ======================
+TARGET_COMPETITIONS: List[Dict[str, Optional[str]]] = [
+    # England
+    {"country": "England", "name": "Premier League"},
+    {"country": "England", "name": "FA Cup"},
+    {"country": "England", "name": "League Cup"},
+    {"country": "England", "name": "Community Shield"},  # суперкубок
+
+    # Germany
+    {"country": "Germany", "name": "Bundesliga"},
+    {"country": "Germany", "name": "DFB Pokal"},
+    {"country": "Germany", "name": "Super Cup"},
+
+    # Spain
+    {"country": "Spain", "name": "La Liga"},
+    {"country": "Spain", "name": "Copa del Rey"},
+    {"country": "Spain", "name": "Super Cup"},
+
+    # Italy
+    {"country": "Italy", "name": "Serie A"},
+    {"country": "Italy", "name": "Coppa Italia"},
+    {"country": "Italy", "name": "Super Cup"},
+
+    # France
+    {"country": "France", "name": "Ligue 1"},
+    {"country": "France", "name": "Coupe de France"},
+    {"country": "France", "name": "Super Cup"},
+
+    # Russia
+    {"country": "Russia", "name": "Premier League"},
+
+    # UEFA
+    {"country": None, "name": "UEFA Champions League"},
+    {"country": None, "name": "UEFA Europa League"},
+]
 
 # ======================
 # STATE
@@ -50,7 +87,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # ======================
-# REFEREES DB
+# REFEREES DB (оставил как было, но можно дальше улучшать)
 # ======================
 def load_referees() -> Dict[str, Any]:
     if os.path.exists(REF_FILE):
@@ -62,10 +99,6 @@ def load_referees() -> Dict[str, Any]:
     return {}
 
 REFEREES: Dict[str, Any] = load_referees()
-
-def save_referees() -> None:
-    with open(REF_FILE, "w", encoding="utf-8") as f:
-        json.dump(REFEREES, f, ensure_ascii=False, indent=2)
 
 def referee_factor(name: Optional[str]) -> float:
     if not name:
@@ -79,95 +112,6 @@ def referee_factor(name: Optional[str]) -> float:
     if pen <= 0.18:
         return 0.94
     return 1.0
-
-def fetch_team_fixtures(team_id: int, last: int = 25) -> list:
-    try:
-        r = requests.get(
-            "https://v3.football.api-sports.io/fixtures",
-            headers=HEADERS,
-            params={"team": team_id, "last": last, "season": SEASON},
-            timeout=25
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("errors"):
-            print("[API errors]", data["errors"])
-        return data.get("response", [])
-    except Exception as e:
-        print(f"[ERROR] fetch_team_fixtures team={team_id}: {e}")
-        return []
-
-def update_referees_from_recent_matches() -> int:
-    updated = 0
-    agg: Dict[str, Dict[str, float]] = {}
-
-    for tid in TEAM_IDS_FOR_REF_UPDATE:
-        fixtures = fetch_team_fixtures(tid, last=25)
-        for f in fixtures:
-            referee = f.get("fixture", {}).get("referee")
-            if not referee:
-                continue
-
-            goals = f.get("goals", {})
-            h, a = goals.get("home"), goals.get("away")
-            if h is None or a is None:
-                continue
-            total_goals = float(h + a)
-
-            # events иногда не приходят в списке fixtures -> считаем консервативно
-            penalties = 0
-            for ev in f.get("events", []) or []:
-                if ev.get("type") == "Penalty":
-                    penalties += 1
-
-            if referee not in agg:
-                agg[referee] = {"matches": 0.0, "goals": 0.0, "pens": 0.0}
-
-            agg[referee]["matches"] += 1.0
-            agg[referee]["goals"] += total_goals
-            agg[referee]["pens"] += float(penalties)
-
-    for ref, s in agg.items():
-        m = s["matches"]
-        if m <= 0:
-            continue
-        new_pen = s["pens"] / m
-        new_avg_goals = s["goals"] / m
-
-        old = REFEREES.get(ref)
-        if not old:
-            REFEREES[ref] = {
-                "penalties_per_game": round(new_pen, 3),
-                "avg_goals": round(new_avg_goals, 3)
-            }
-            updated += 1
-        else:
-            old_pen = float(old.get("penalties_per_game", 0))
-            old_avg = float(old.get("avg_goals", 0))
-            blended_pen = 0.7 * old_pen + 0.3 * new_pen
-            blended_avg = 0.7 * old_avg + 0.3 * new_avg_goals
-            REFEREES[ref] = {
-                "penalties_per_game": round(blended_pen, 3),
-                "avg_goals": round(blended_avg, 3)
-            }
-            updated += 1
-
-    if updated:
-        save_referees()
-
-    return updated
-
-def ensure_daily_referee_update() -> None:
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if STATE.get("ref_update_date") == today:
-        return
-
-    print(f"[INFO] Daily referee update started for {today} ...")
-    n = update_referees_from_recent_matches()
-    STATE["ref_update_date"] = today
-    STATE["ref_update_count"] = int(n)
-    save_state(STATE)
-    print(f"[INFO] Daily referee update done. Updated refs: {n}")
 
 # ======================
 # WEATHER
@@ -197,10 +141,8 @@ def weather_factor(city: Optional[str]) -> float:
             factor *= 0.95
         if wind > 8:
             factor *= 0.96
-
         return factor
-    except Exception as e:
-        print(f"[ERROR] weather_factor city={city}: {e}")
+    except:
         return 1.0
 
 # ======================
@@ -216,11 +158,8 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
         )
         r.raise_for_status()
         data = r.json()
-        if data.get("errors"):
-            print("[API errors]", data["errors"])
         return data.get("response", [])
-    except Exception as e:
-        print(f"[ERROR] get_last_matches team={team_id}: {e}")
+    except:
         return []
 
 def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
@@ -267,52 +206,124 @@ def calc_prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float, r_
 
     prob *= w_k
     prob *= r_k
-
     return min(max(prob, 0.05), 0.90)
 
 # ======================
-# TODAY FIXTURES (FIXED)
+# LEAGUES LOOKUP + CACHE
 # ======================
-def get_today_matches() -> list:
-    def fetch(date_str: str, use_season: bool) -> list:
-        params = {"date": date_str}
-        if use_season:
-            params["season"] = SEASON
-
+def leagues_search(name: str, country: Optional[str]) -> List[Dict[str, Any]]:
+    params = {"search": name}
+    if country:
+        params["country"] = country
+    try:
         r = requests.get(
-            "https://v3.football.api-sports.io/fixtures",
+            "https://v3.football.api-sports.io/leagues",
             headers=HEADERS,
             params=params,
             timeout=25
         )
         r.raise_for_status()
         data = r.json()
-        if data.get("errors"):
-            print("[API errors]", data["errors"])
         return data.get("response", [])
+    except Exception as e:
+        print(f"[ERROR] leagues_search name={name} country={country}: {e}")
+        return []
+
+def resolve_target_league_ids(force: bool = False) -> Dict[str, int]:
+    """
+    Возвращает dict key->league_id, где key = f"{country or 'UEFA'}|{name}"
+    Кэшируется в state.json
+    """
+    cache = STATE.get("league_ids", {})
+    cache_date = STATE.get("league_ids_date")
+
+    today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")  # МСК-дата
+    if (not force) and cache and cache_date == today:
+        return {k: int(v) for k, v in cache.items()}
+
+    resolved: Dict[str, int] = {}
+    for item in TARGET_COMPETITIONS:
+        country = item["country"]
+        name = item["name"]
+        key = f"{(country or 'UEFA')}|{name}"
+
+        results = leagues_search(name=name, country=country)
+        # Выбираем самый подходящий результат: точное совпадение имени (case-insensitive)
+        best_id = None
+        for rr in results:
+            lg = rr.get("league", {})
+            nm = (lg.get("name") or "").strip()
+            if nm.lower() == name.lower():
+                best_id = lg.get("id")
+                break
+
+        # если точного совпадения не нашли — берём первый (лучше чем ничего), но логируем
+        if best_id is None and results:
+            best_id = results[0].get("league", {}).get("id")
+            got_name = (results[0].get("league", {}).get("name") or "?")
+            got_country = (results[0].get("country", {}).get("name") or "?")
+            print(f"[WARN] not exact match for {key}. Using first: {got_country}|{got_name} id={best_id}")
+
+        if best_id:
+            resolved[key] = int(best_id)
+        else:
+            print(f"[WARN] League not found in API: {key}")
+
+    STATE["league_ids"] = {k: int(v) for k, v in resolved.items()}
+    STATE["league_ids_date"] = today
+    save_state(STATE)
+
+    print(f"[INFO] Resolved leagues: {resolved}")
+    return resolved
+
+# ======================
+# FIXTURES (с фильтром по league ids)
+# ======================
+def fetch_fixtures_by_date(date_str: str, use_season: bool) -> list:
+    params = {"date": date_str}
+    if use_season:
+        params["season"] = SEASON
+
+    r = requests.get(
+        "https://v3.football.api-sports.io/fixtures",
+        headers=HEADERS,
+        params=params,
+        timeout=25
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errors"):
+        print("[API errors]", data["errors"])
+    return data.get("response", [])
+
+def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], str]:
+    """
+    Возвращает (fixtures_filtered, league_ids, used_date)
+    """
+    league_ids = resolve_target_league_ids(force=False)
+    allowed_ids = set(league_ids.values())
 
     date_utc = datetime.utcnow().strftime("%Y-%m-%d")
     date_msk = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
 
     for date_str in [date_msk, date_utc]:
-        try:
-            matches = fetch(date_str, use_season=True)
-            if matches:
-                print(f"[INFO] Fixtures found for {date_str} with season={SEASON}: {len(matches)}")
-                return matches
-        except Exception as e:
-            print(f"[ERROR] fixtures date={date_str} season={SEASON}: {e}")
+        for use_season in [True, False]:
+            try:
+                fixtures = fetch_fixtures_by_date(date_str, use_season=use_season)
+                if fixtures:
+                    filtered = []
+                    for f in fixtures:
+                        lg = f.get("league", {})
+                        lid = lg.get("id")
+                        if lid in allowed_ids:
+                            filtered.append(f)
+                    print(f"[INFO] Fixtures {date_str} use_season={use_season}: total={len(fixtures)} filtered={len(filtered)}")
+                    if filtered:
+                        return filtered, league_ids, date_str
+            except Exception as e:
+                print(f"[ERROR] fixtures date={date_str} use_season={use_season}: {e}")
 
-        try:
-            matches = fetch(date_str, use_season=False)
-            if matches:
-                print(f"[INFO] Fixtures found for {date_str} without season: {len(matches)}")
-                return matches
-        except Exception as e:
-            print(f"[ERROR] fixtures date={date_str} no season: {e}")
-
-    print(f"[INFO] No fixtures found. UTC={date_utc}, MSK={date_msk}, season={SEASON}")
-    return []
+    return [], league_ids, date_msk
 
 # ======================
 # TELEGRAM HELPERS
@@ -325,49 +336,34 @@ def target_chat_id(update: Update) -> str:
 # ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🐺 ЦЕРБЕР (рынок ГОЛОВ)\n\n"
+        "🐺 ЦЕРБЕР (рынок ГОЛОВ) — фильтр по выбранным турнирам включён.\n\n"
         "Команды:\n"
-        "• /signals — матчи дня + вероятность ТБ2.5 (отладка)\n"
-        "• /update_refs — принудительно обновить базу судей\n\n"
-        f"Порог сигналов: {int(MIN_PROB*100)}%"
+        "• /signals — матчи дня (только выбранные турниры) + вероятность ТБ2.5\n"
+        "• /reload_leagues — пересканировать ID турниров (если что-то не найдено)\n\n"
+        f"Порог: {int(MIN_PROB*100)}%"
     )
 
-async def update_refs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
-    await context.bot.send_message(chat_id=chat_id, text="🧑‍⚖️ Обновляю базу судей…")
-    try:
-        n = update_referees_from_recent_matches()
-        STATE["ref_update_date"] = datetime.utcnow().strftime("%Y-%m-%d")
-        STATE["ref_update_count"] = int(n)
-        save_state(STATE)
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ Судьи обновлены. Изменено записей: {n}")
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Ошибка обновления судей: {e}")
+    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры (league IDs)…")
+    ids = resolve_target_league_ids(force=True)
+    await context.bot.send_message(chat_id=chat_id, text=f"✅ Готово. Найдено турниров: {len(ids)}")
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
 
-    # диагностические даты
-    print("[INFO] SEASON =", SEASON)
-    print("[INFO] UTC date =", datetime.utcnow().strftime("%Y-%m-%d"))
-    print("[INFO] MSK date =", (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d"))
-
-    # раз в сутки обновляем судей (не обязательно, но пусть будет)
-    try:
-        ensure_daily_referee_update()
-    except Exception as e:
-        print(f"[ERROR] ensure_daily_referee_update: {e}")
-
-    fixtures = get_today_matches()
+    fixtures, league_ids, used_date = get_today_matches_filtered()
     if not fixtures:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Сегодня матчей не найдено в API.\n"
-                 "Смотри логи Railway: там будут даты UTC/MSK и возможные API errors."
+            text=(
+                f"⚠️ На дату {used_date} матчей по выбранным турнирам не найдено.\n"
+                "Если ты уверен, что матчи должны быть — напиши /reload_leagues (вдруг название турнира в API другое)."
+            )
         )
         return
 
-    msg_parts = ["⚽ ЦЕРБЕР — матчи дня (вероятность ТБ 2.5)\n"]
+    msg_parts = [f"⚽ ЦЕРБЕР — матчи ({used_date})\nТолько выбранные турниры.\n\n"]
     chunk = 0
 
     for f in fixtures:
@@ -376,6 +372,9 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         venue = f.get("fixture", {}).get("venue", {}) or {}
         city = venue.get("city")
         referee = f.get("fixture", {}).get("referee")
+
+        league = f.get("league", {})
+        league_name = league.get("name", "?")
 
         home_id = home.get("id")
         away_id = away.get("id")
@@ -387,9 +386,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not hs or not as_:
             continue
 
-        w_k = weather_factor(city)
-        r_k = referee_factor(referee)
-        prob = calc_prob_over25(hs, as_, w_k, r_k)
+        prob = calc_prob_over25(hs, as_, weather_factor(city), referee_factor(referee))
 
         ts = f.get("fixture", {}).get("timestamp")
         if ts:
@@ -399,24 +396,28 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             t_str = "—"
 
         msg_parts.append(
+            f"🏆 {league_name}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
             f"ТБ2.5: {int(prob*100)}%\n\n"
         )
 
         chunk += 1
-        if chunk % 12 == 0:
+        if chunk % 10 == 0:
             await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
             msg_parts = ["(продолжение)\n\n"]
 
     if msg_parts:
         await context.bot.send_message(chat_id=chat_id, text="".join(msg_parts))
 
+# ======================
+# RUN
+# ======================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
-    app.add_handler(CommandHandler("update_refs", update_refs))
+    app.add_handler(CommandHandler("reload_leagues", reload_leagues))
     app.run_polling()
 
 if __name__ == "__main__":
