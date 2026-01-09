@@ -31,8 +31,7 @@ BTTS_MAX_ODDS = float(os.getenv("BTTS_MAX_ODDS", "15.0"))
 
 STATE_FILE = "state.json"
 
-# Pinnacle name matching:
-# В API может быть "Pinnacle" или "Pinnacle Sports" и т.п.
+# Pinnacle matching: в API может быть "Pinnacle" / "Pinnacle Sports" и т.п.
 PINNACLE_MATCH = "pinnacle"
 
 # ======================
@@ -252,20 +251,16 @@ def label_is_no(label: str) -> bool:
     return norm(label) in ["no", "n", "нет"]
 
 def extract_pinnacle_odds(odds_response: list) -> Tuple[Dict[str, Optional[float]], Optional[str]]:
-    """
-    Возвращает (odds_dict, bookmaker_actual_name_if_found)
-    """
     out = {"O25": None, "U25": None, "BTTS_Y": None, "BTTS_N": None}
     if not odds_response:
         return out, None
 
     for item in odds_response:
         for bm in (item.get("bookmakers") or []):
-            bm_name = norm(bm.get("name"))
-            if PINNACLE_MATCH not in bm_name:
+            bm_name_norm = norm(bm.get("name"))
+            if PINNACLE_MATCH not in bm_name_norm:
                 continue
 
-            # нашли Pinnacle (или Pinnacle Sports)
             actual_name = bm.get("name") or "Pinnacle"
 
             for bet in (bm.get("bets") or []):
@@ -438,9 +433,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "• /signals — только value-сигналы\n"
         "• /all — все матчи с P и Pinnacle odds (без фильтров)\n"
-        "• /check — диагностика: матчи/odds/pinnacle\n\n"
+        "• /check — диагностика: матчи/odds/pinnacle\n"
+        "• /reload_leagues — пересканировать турниры\n\n"
         f"Пороги: P ≥ {int(MIN_PROB*100)}%, Value > {MIN_VALUE:+.2f}\n"
     )
+
+async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = target_chat_id(update)
+    await context.bot.send_message(chat_id=chat_id, text="🔄 Пересканирую турниры…")
+
+    resolved, missing = resolve_target_league_ids(force=True)
+
+    text = "✅ Найденные турниры:\n"
+    if resolved:
+        for k in sorted(resolved.keys()):
+            text += f"• {k} → ID {resolved[k]}\n"
+    else:
+        text += "• (пусто)\n"
+
+    text += "\n❌ Не найдены:\n"
+    if missing:
+        for m in missing:
+            text += f"• {m}\n"
+    else:
+        text += "• (все найдены)\n"
+
+    for part in chunked(text):
+        await context.bot.send_message(chat_id=chat_id, text=part)
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = target_chat_id(update)
@@ -455,8 +474,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pinn_present = 0
     pinn_with_any_market = 0
 
-    # проверим первые 15 матчей, чтобы не спалить лимиты
-    sample = fixtures[:15]
+    sample = fixtures[:15]  # чтобы не бить лимиты
 
     for f in sample:
         fixture_id = (f.get("fixture") or {}).get("id")
@@ -479,8 +497,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Проверено матчей: {len(sample)}\n"
         f"Odds ответ не пустой: {odds_present}/{len(sample)}\n"
         f"Pinnacle найден в odds: {pinn_present}/{len(sample)}\n"
-        f"Pinnacle и есть рынки (O/U или BTTS): {pinn_with_any_market}/{len(sample)}\n\n"
-        "Если последние две строки почти 0 — значит Pinnacle не отдаёт линии через API на эти матчи (или рынок называется иначе)."
+        f"Pinnacle и есть рынки (O/U или BTTS): {pinn_with_any_market}/{len(sample)}\n"
     )
     await context.bot.send_message(chat_id=chat_id, text=text)
 
@@ -492,10 +509,10 @@ async def all_matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
         return
 
-    out = [f"📋 ALL ({used_date}) — все матчи (без фильтра value)\nИсточник odds: Pinnacle\n\n"]
+    out = [f"📋 ALL ({used_date}) — без фильтра value\nOdds: Pinnacle\n\n"]
     sent = 0
 
-    for f in fixtures[:20]:  # ограничим выводом 20, чтобы не спамить
+    for f in fixtures[:20]:
         fixture = f.get("fixture") or {}
         fixture_id = fixture.get("id")
         home = (f.get("teams") or {}).get("home", {}) or {}
@@ -563,7 +580,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=f"⚠️ На дату {used_date} матчей нет.")
         return
 
-    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nИсточник odds: Pinnacle\n\n"]
+    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nOdds: Pinnacle\n\n"]
     found_any = 0
     count = 0
 
@@ -603,7 +620,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         odds_resp = fetch_fixture_odds(int(fixture_id))
         odds_pin, pin_name = extract_pinnacle_odds(odds_resp)
         if not pin_name:
-            continue  # Pinnacle не найден в API odds для этого матча
+            continue
 
         def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
             if book is None:
@@ -649,9 +666,9 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 f"📭 На дату {used_date} нет value-сигналов по Pinnacle при порогах:\n"
                 f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n\n"
-                "Чтобы убедиться, что всё работает:\n"
-                "• /check — покажет, есть ли Pinnacle вообще в odds\n"
-                "• /all — покажет odds/P по матчам без фильтров\n"
+                "Проверь:\n"
+                "• /check — есть ли Pinnacle вообще в odds\n"
+                "• /all — покажет P и odds без фильтров\n"
             )
         )
         return
@@ -673,3 +690,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
