@@ -18,7 +18,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 ODDSPAPI_KEY = os.getenv("ODDSPAPI_KEY")
 ODDSPAPI_BOOKMAKER = os.getenv("ODDSPAPI_BOOKMAKER", "1xbet")
-WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # optional
+WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # optional (OpenWeather)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не задан")
@@ -34,22 +34,18 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))     # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))   # value > 0
 STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit fixed
 
-LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # fallback if lambdas missing
-LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # lambdas + IT
+LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # fallback
+LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # team stats
 
 # -------------------------
 # Anti-anomalies
 # -------------------------
 ANOMALY_VALUE_WARN = float(os.getenv("ANOMALY_VALUE_WARN", "0.50"))
 
-# "Hard sanity" odds ranges by market group.
-# Если коэффициент выходит за диапазон — помечаем как подозрительный и НЕ пишем в статистику.
 SANITY_OU_MIN = float(os.getenv("SANITY_OU_MIN", "1.05"))
 SANITY_OU_MAX = float(os.getenv("SANITY_OU_MAX", "6.00"))
-
 SANITY_BTTS_MIN = float(os.getenv("SANITY_BTTS_MIN", "1.05"))
 SANITY_BTTS_MAX = float(os.getenv("SANITY_BTTS_MAX", "6.00"))
-
 SANITY_IT_MIN = float(os.getenv("SANITY_IT_MIN", "1.05"))
 SANITY_IT_MAX = float(os.getenv("SANITY_IT_MAX", "10.00"))
 
@@ -143,7 +139,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # =====================================================
-# DB (ROI / settle)
+# DB
 # =====================================================
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_FILE)
@@ -206,7 +202,7 @@ def db_upsert_signal(payload: Dict[str, Any]) -> None:
     con.commit()
     con.close()
 
-def db_fetch_pending(limit: int = 80) -> List[Dict[str, Any]]:
+def db_fetch_pending(limit: int = 250) -> List[Dict[str, Any]]:
     con = db_connect()
     con.row_factory = sqlite3.Row
     cur = con.cursor()
@@ -324,13 +320,8 @@ def is_cup_like(league_name: str) -> bool:
 # Anti-anomaly #2: odds sanity check
 # =====================================================
 def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
-    """
-    Возвращает (ok, warn_text)
-    ok=False => коэффициент подозрителен для этого рынка.
-    """
     if book is None or not isinstance(book, (int, float)):
         return False, "⚠️ подозрительная линия (odds)"
-
     book = float(book)
 
     if market_code in {"O25", "U25"}:
@@ -345,7 +336,6 @@ def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
         ok = (SANITY_IT_MIN <= book <= SANITY_IT_MAX)
         return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
 
-    # если рынок неизвестный — не считаем подозрительным
     return True, ""
 
 # =====================================================
@@ -420,37 +410,53 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
         return None
     return {"avg": total_goals / n, "btts": btts_yes / n, "over25": over25 / n}
 
-def team_goal_stats(team_id: int, last: int = 8) -> Optional[Dict[str, float]]:
-    matches = get_last_matches(team_id, last=last)
+def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[Dict[str, float]]:
+    matches = get_last_matches(team_id, last=last + 8)  # запас
     scored = 0.0
     conceded = 0.0
     n = 0.0
+    opponents: List[int] = []
+
     for m in matches:
         goals = m.get("goals", {}) or {}
         h, a = goals.get("home"), goals.get("away")
         if h is None or a is None:
             continue
+
         teams = m.get("teams", {}) or {}
         home = (teams.get("home") or {}).get("id")
         away = (teams.get("away") or {}).get("id")
         if not home or not away:
             continue
+
+        # фильтр venue
+        if venue == "home" and int(home) != int(team_id):
+            continue
+        if venue == "away" and int(away) != int(team_id):
+            continue
+
         h = float(h); a = float(a)
+
         if int(home) == int(team_id):
             scored += h
             conceded += a
-        elif int(away) == int(team_id):
+            opponents.append(int(away))
+        else:
             scored += a
             conceded += h
-        else:
-            continue
+            opponents.append(int(home))
+
         n += 1.0
+        if n >= last:
+            break
+
     if n == 0:
         return None
-    return {"scored": scored / n, "conceded": conceded / n, "n": n}
+
+    return {"scored": scored / n, "conceded": conceded / n, "n": n, "opp_ids": opponents}
 
 # =====================================================
-# Factors: injuries / fatigue / motivation
+# Factors: injuries / fatigue / motivation / SOS
 # =====================================================
 def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
     out: Dict[int, Dict[str, int]] = {}
@@ -551,10 +557,7 @@ def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
                 tid = team.get("id")
                 if not tid:
                     continue
-                out[int(tid)] = {
-                    "rank": int(row.get("rank") or 0),
-                    "points": int(row.get("points") or 0),
-                }
+                out[int(tid)] = {"rank": int(row.get("rank") or 0), "points": int(row.get("points") or 0)}
     except:
         return out
 
@@ -562,6 +565,36 @@ def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
     STATE[key + "_date"] = today
     save_state(STATE)
     return out
+
+def strength_of_schedule_factor(league_id: Optional[int], opp_ids: List[int]) -> Tuple[float, str]:
+    if not league_id or not opp_ids:
+        return 1.0, "sos=0%"
+    smap = get_standings_map(int(league_id))
+    if not smap:
+        return 1.0, "sos=0%"
+
+    pts = []
+    for oid in opp_ids:
+        row = smap.get(int(oid))
+        if row and row.get("points") is not None:
+            pts.append(int(row["points"]))
+    if len(pts) < 3:
+        return 1.0, "sos=0%"
+
+    league_pts = [int(v.get("points") or 0) for v in smap.values() if v.get("points") is not None]
+    if not league_pts:
+        return 1.0, "sos=0%"
+
+    avg_opp = sum(pts) / len(pts)
+    avg_lg = sum(league_pts) / len(league_pts)
+    if avg_lg <= 0:
+        return 1.0, "sos=0%"
+
+    diff = (avg_opp - avg_lg) / avg_lg
+    diff = max(-0.15, min(0.15, diff))
+    k = 1.0 + 0.04 * diff
+    pct = int(round((k - 1.0) * 100))
+    return k, f"sos={pct:+d}%"
 
 def get_motivation_factor(league_name: str, league_id: Optional[int], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
     if is_cup_like(league_name):
@@ -653,7 +686,7 @@ def prob_btts_fallback(hs: Dict[str, float], as_: Dict[str, float], w_k: float) 
     return clamp(p, 0.05, 0.90)
 
 # =====================================================
-# API-Football: resolve league ids + fixtures today filtered
+# API-Football: league ids + fixtures today filtered
 # =====================================================
 def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": search_text}
@@ -760,7 +793,7 @@ def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
     params["apiKey"] = ODDSPAPI_KEY
     url = f"https://api.oddspapi.io{path}"
 
-    for _ in range(6):
+    for _ in range(7):
         r = requests.get(url, params=params, timeout=30)
         if r.status_code == 429:
             try:
@@ -768,7 +801,7 @@ def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
                 retry_ms = int(j.get("error", {}).get("retryMs", 250))
             except:
                 retry_ms = 250
-            time.sleep(max(0.05, retry_ms / 1000.0))
+            time.sleep(max(0.06, retry_ms / 1000.0))
             continue
         if r.status_code >= 400:
             raise RuntimeError(f"OddsPapi HTTP {r.status_code}: {r.text[:500]}")
@@ -830,7 +863,7 @@ def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[s
         )
         if isinstance(part, list):
             all_items.extend(part)
-        time.sleep(0.08)
+        time.sleep(0.09)
     return all_items
 
 MARKETS_CACHE_KEY = "oddspapi_markets"
@@ -1091,7 +1124,7 @@ def match_odds_for_fixture(date_msk: str, fixture_ts_msk: int, home_name: str, a
     return None
 
 # =====================================================
-# Settlement
+# Settlement helpers
 # =====================================================
 def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
     out: Dict[int, Dict[str, Any]] = {}
@@ -1145,6 +1178,7 @@ def settle_result_for_market(market_code: str, hg: int, ag: int) -> str:
             return "WIN" if tg > line else "LOSE"
         else:
             return "WIN" if tg < line else "LOSE"
+
     return "PUSH"
 
 def profit_for_result(result: str, odds: float, stake: float) -> float:
@@ -1174,13 +1208,20 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
     if not fixture_id or not home_id or not away_id or not ts:
         return None, None, "Factors: (no ids)", {}
 
-    home_stats = team_goal_stats(int(home_id), last=LAST_MATCHES_TEAM)
-    away_stats = team_goal_stats(int(away_id), last=LAST_MATCHES_TEAM)
+    # home/away venue stats
+    home_stats = team_goal_stats_venue(int(home_id), venue="home", last=LAST_MATCHES_TEAM)
+    away_stats = team_goal_stats_venue(int(away_id), venue="away", last=LAST_MATCHES_TEAM)
     if not home_stats or not away_stats:
-        return None, None, "Factors: (fallback — no λ stats)", {}
+        return None, None, "Factors: (fallback — no venue λ stats)", {}
 
     lam_home = max(0.05, (home_stats["scored"] + away_stats["conceded"]) / 2.0)
     lam_away = max(0.05, (away_stats["scored"] + home_stats["conceded"]) / 2.0)
+
+    # SOS
+    sos_h_k, sos_h_why = strength_of_schedule_factor(league_id, home_stats.get("opp_ids") or [])
+    sos_a_k, sos_a_why = strength_of_schedule_factor(league_id, away_stats.get("opp_ids") or [])
+    lam_home *= sos_h_k
+    lam_away *= sos_a_k
 
     # weather
     venue = fixture.get("venue") or {}
@@ -1207,7 +1248,11 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
     lam_home = max(0.05, min(lam_home, 3.5))
     lam_away = max(0.05, min(lam_away, 3.5))
 
-    factors_line = f"Factors: {inj_h}, {inj_a}; {fat_h_why}({fat_h_n}), {fat_a_why}({fat_a_n}); {mot_h_why}, {mot_a_why}; {w_why}"
+    factors_line = (
+        f"Factors: {inj_h}, {inj_a}; "
+        f"{fat_h_why}({fat_h_n}), {fat_a_why}({fat_a_n}); "
+        f"{mot_h_why}, {mot_a_why}; {sos_h_why}, {sos_a_why}; {w_why}"
+    )
 
     debug = {
         "fixture_id": int(fixture_id),
@@ -1231,13 +1276,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
         "Команды:\n"
-        "• /signals — value-сигналы (OU2.5, BTTS, ИТ) + факторы + Model λ\n"
-        "• /lines — линии (без фильтра)\n"
-        "• /factors — факторы на сегодня (или /factors 3)\n"
-        "• /settle — посчитать результаты\n"
+        "• /signals — value-сигналы (OU2.5, BTTS, ИТ) + факторы\n"
+        "• /lines — линии (без фильтра value)\n"
+        "• /settle — рассчитать результаты PENDING\n"
         "• /roi — ROI/проходимость\n"
         "• /history — последние 20 сигналов\n"
-        "• /oddspapi_account — проверка ключа OddsPapi\n"
+        "• /oddspapi_account — проверка OddsPapi\n"
         "• /reload_leagues — пересканировать лиги\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
@@ -1268,60 +1312,6 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for part in chunked(text):
         await update.message.reply_text(part)
-
-# ---------------------------
-# /factors
-# ---------------------------
-async def factors(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures, _, _, used_date = get_today_matches_filtered()
-    if not fixtures:
-        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет.")
-        return
-
-    idx: Optional[int] = None
-    if context.args:
-        try:
-            idx = int(context.args[0])
-        except:
-            idx = None
-
-    def key_ts(fx): return int((fx.get("fixture") or {}).get("timestamp") or 0)
-    fixtures_sorted = sorted(fixtures, key=key_ts)
-
-    if idx is not None:
-        if idx < 1 or idx > len(fixtures_sorted):
-            await update.message.reply_text(f"❌ Неверный номер. Доступно 1..{len(fixtures_sorted)}")
-            return
-        fixtures_sorted = [fixtures_sorted[idx - 1]]
-
-    msg = [f"🧠 FACTORS ({used_date})\n\n"]
-    n = 0
-    for i, f in enumerate(fixtures_sorted, start=1):
-        fixture = f.get("fixture") or {}
-        teams = f.get("teams") or {}
-        home = (teams.get("home") or {}).get("name", "?")
-        away = (teams.get("away") or {}).get("name", "?")
-        league = (f.get("league") or {}).get("name", "?")
-        ts = int(fixture.get("timestamp") or 0)
-        t_str = (datetime.utcfromtimestamp(ts) + timedelta(hours=3)).strftime("%H:%M МСК") if ts else "?"
-
-        lh, la, factors_line, _ = compute_lambdas_and_factors(f)
-        if lh is None or la is None:
-            factors_line = "Factors: (fallback/no λ stats)"
-        msg.append(
-            f"{i}) 🏆 {league}\n"
-            f"{home} — {away}\n"
-            f"🕒 {t_str}\n"
-            f"{factors_line}\n"
-            f"λ_home={('—' if lh is None else f'{lh:.2f}')}, λ_away={('—' if la is None else f'{la:.2f}')}\n\n"
-        )
-        n += 1
-        if n % 8 == 0:
-            await update.message.reply_text("".join(msg))
-            msg = ["(продолжение)\n\n"]
-
-    if msg:
-        await update.message.reply_text("".join(msg))
 
 # ---------------------------
 # /lines
@@ -1387,7 +1377,7 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("".join(msg))
 
 # ---------------------------
-# /signals (value + factors + Model λ + anti-anomalies)
+# /signals
 # ---------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -1412,11 +1402,8 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if book is None:
             return None
 
-        # ---- Anti-anomaly #2 (odds sanity) ----
         ok_odds, odds_warn = odds_sanity(market_code, float(book))
-        # (мы покажем предупреждение, но не будем сохранять в БД если ok_odds=False)
 
-        # фильтр на P / value
         if p < MIN_PROB:
             return None
 
@@ -1426,15 +1413,13 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         fair = fair_odds(p)
 
-        # ---- Anti-anomaly #1 (too big value) ----
         value_warn = "⚠️ проверь линию вручную" if v > ANOMALY_VALUE_WARN else ""
-
         warns = " ".join([w for w in [value_warn, odds_warn] if w]).strip()
         warns = f" {warns}" if warns else ""
 
         text = f"{market_label}: P={int(p*100)}% | Book={float(book):.2f} | Fair={fair:.2f} | Value={v:+.2f}{warns}"
 
-        # сохраняем ТОЛЬКО если odds не подозрительные
+        # сохраняем в БД только если odds выглядят нормальными
         if ok_odds:
             db_upsert_signal({
                 "created_at": datetime.utcnow().isoformat(),
@@ -1489,10 +1474,8 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         odds = parse_odds(it, markets_meta)
 
-        # factors + lambdas
         lam_home, lam_away, factors_line, _dbg = compute_lambdas_and_factors(f)
 
-        # probabilities
         used_poisson = False
         if lam_home is not None and lam_away is not None:
             used_poisson = True
@@ -1516,12 +1499,13 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines_out: List[str] = []
 
-        for market_code, label, p, book, line, side in [
+        base_markets = [
             ("O25", "ТБ 2.5", p_o25, odds.get("O25"), 2.5, "O"),
             ("U25", "ТМ 2.5", p_u25, odds.get("U25"), 2.5, "U"),
             ("BTTS_Y", "ОЗ Да", p_btts_y, odds.get("BTTS_Y"), None, "Y"),
             ("BTTS_N", "ОЗ Нет", p_btts_n, odds.get("BTTS_N"), None, "N"),
-        ]:
+        ]
+        for market_code, label, p, book, line, side in base_markets:
             s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
                                 market_code, label, line, side, p, book)
             if s:
@@ -1556,11 +1540,11 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         found_any += 1
-
-        if lam_home is not None and lam_away is not None:
-            model_line = f"Model λ: Home={lam_home:.2f} | Away={lam_away:.2f} | Total={(lam_home+lam_away):.2f}"
-        else:
-            model_line = "Model λ: — (fallback mode)"
+        model_line = (
+            f"Model λ: Home={lam_home:.2f} | Away={lam_away:.2f} | Total={(lam_home+lam_away):.2f}"
+            if (lam_home is not None and lam_away is not None)
+            else "Model λ: — (fallback mode)"
+        )
 
         out.append(
             f"🏆 {league_name}\n"
@@ -1589,52 +1573,43 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("".join(out))
 
 # ---------------------------
-# /settle
+# /settle (FIXED)
 # ---------------------------
 async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = db_fetch_pending(limit=160)
+    pending = db_fetch_pending(limit=250)
     if not pending:
         await update.message.reply_text("✅ Нет PENDING сигналов. Всё рассчитано.")
         return
 
-    now = datetime.utcnow()
-    due = []
-    for s in pending:
-        try:
-            md = datetime.fromisoformat(s["match_date"])
-        except:
-            continue
-        if md + timedelta(hours=2) <= now:
-            due.append(s)
-
-    if not due:
-        await update.message.reply_text("⏳ Пока нет матчей, которые уже точно завершились. Попробуй позже.")
-        return
-
-    fixture_ids = sorted(list(set(int(s["fixture_id"]) for s in due)))
+    fixture_ids = sorted(list(set(int(s["fixture_id"]) for s in pending)))
     fx_map = fetch_fixtures_by_ids(fixture_ids)
 
     settled_count = 0
-    skipped_not_finished = 0
+    not_finished = 0
+    missing = 0
 
-    for s in due:
+    for s in pending:
         fid = int(s["fixture_id"])
         fx = fx_map.get(fid)
         if not fx:
+            missing += 1
             continue
 
         fixture = fx.get("fixture", {}) or {}
         status = (fixture.get("status", {}) or {}).get("short", "")
         if not is_finished_status(status):
-            skipped_not_finished += 1
+            not_finished += 1
             continue
 
         goals = fx.get("goals", {}) or {}
         hg = goals.get("home")
         ag = goals.get("away")
         if hg is None or ag is None:
+            not_finished += 1
             continue
-        hg = int(hg); ag = int(ag)
+
+        hg = int(hg)
+        ag = int(ag)
 
         market_code = s["market_code"]
         res = settle_result_for_market(market_code, hg, ag)
@@ -1643,9 +1618,10 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settled_count += 1
 
     await update.message.reply_text(
-        f"✅ SETTLE готово.\n"
+        "✅ SETTLE готово.\n"
         f"Рассчитано: {settled_count}\n"
-        f"Ещё не завершились: {skipped_not_finished}"
+        f"Ещё не завершились: {not_finished}\n"
+        f"Не найдены в API: {missing}"
     )
 
 # ---------------------------
@@ -1706,7 +1682,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("lines", lines))
-    app.add_handler(CommandHandler("factors", factors))
     app.add_handler(CommandHandler("settle", settle))
     app.add_handler(CommandHandler("roi", roi))
     app.add_handler(CommandHandler("history", history))
