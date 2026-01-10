@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import math
 import unicodedata
 import requests
 from datetime import datetime, timedelta
@@ -31,6 +32,10 @@ SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))   # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00")) # value > 0
 
+# сколько матчей брать для модели (можно менять env)
+LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))     # для общих (ТБ/ТМ, ОЗ)
+LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))       # для ИТ
+
 # sanity filters for odds
 OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.05")), float(os.getenv("OU_ODDS_MAX", "20.0"))
 BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.05")), float(os.getenv("BTTS_ODDS_MAX", "20.0"))
@@ -39,7 +44,6 @@ STATE_FILE = "state.json"
 
 # =====================================================
 # TARGET TOURNAMENTS (Oddspapi)
-# categoryName + tournamentName
 # =====================================================
 TARGET_TOURNAMENTS_ODDSPAPI = [
     ("England", "Premier League"),
@@ -212,7 +216,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # =====================================================
-# API-Football: last matches -> goal model
+# API-Football: last matches
 # =====================================================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -227,6 +231,7 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
     except:
         return []
 
+# --- totals / btts stats ---
 def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
     total_goals = 0.0
     btts_yes = 0.0
@@ -269,6 +274,63 @@ def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> fl
     p += 0.05 * (((hs["avg"] + as_["avg"]) / 2.0) - 2.4)
     p *= w_k
     return clamp(p, 0.05, 0.90)
+
+# --- team scored/conceded stats (for Individual Totals) ---
+def team_goal_stats(team_id: int, last: int = 8) -> Optional[Dict[str, float]]:
+    matches = get_last_matches(team_id, last=last)
+    scored = 0.0
+    conceded = 0.0
+    n = 0.0
+    for m in matches:
+        goals = m.get("goals", {}) or {}
+        h, a = goals.get("home"), goals.get("away")
+        if h is None or a is None:
+            continue
+        teams = m.get("teams", {}) or {}
+        home = (teams.get("home") or {}).get("id")
+        away = (teams.get("away") or {}).get("id")
+        if not home or not away:
+            continue
+        h = float(h); a = float(a)
+        if int(home) == int(team_id):
+            scored += h
+            conceded += a
+        elif int(away) == int(team_id):
+            scored += a
+            conceded += h
+        else:
+            continue
+        n += 1.0
+    if n == 0:
+        return None
+    return {"scored": scored / n, "conceded": conceded / n, "n": n}
+
+# =====================================================
+# Poisson for IT probabilities
+# =====================================================
+def poisson_pmf(k: int, lam: float) -> float:
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+def poisson_cdf(k: int, lam: float) -> float:
+    # P(X <= k)
+    s = 0.0
+    for i in range(0, k + 1):
+        s += poisson_pmf(i, lam)
+    return min(max(s, 0.0), 1.0)
+
+def prob_over_line_poisson(lam: float, line: float) -> float:
+    # lines: 0.5 / 1.5 / 2.5 ...
+    k = int(math.floor(line))  # for 2.5 -> k=2, P(X>2)
+    p = 1.0 - poisson_cdf(k, lam)
+    return clamp(p, 0.05, 0.95)
+
+def prob_under_line_poisson(lam: float, line: float) -> float:
+    # P(X < line+?) for 2.5 -> P(X<=2)
+    k = int(math.floor(line))
+    p = poisson_cdf(k, lam)
+    return clamp(p, 0.05, 0.95)
 
 # =====================================================
 # API-Football: resolve league ids + today fixtures filtered
@@ -516,12 +578,6 @@ TEAM1_OU_NAME = "over under team 1"
 TEAM2_OU_NAME = "over under team 2"
 
 def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) -> Dict[str, Optional[float]]:
-    """
-    Возвращает odds для:
-    - O/U 2.5 (Full Time)
-    - BTTS Yes/No
-    - Team Totals (Team 1 / Team 2) для 0.5 / 1.5 / 2.5
-    """
     out: Dict[str, Optional[float]] = {
         "O25": None, "U25": None,
         "BTTS_Y": None, "BTTS_N": None,
@@ -543,8 +599,8 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         except:
             return None
 
-    def set_ou(out_over_key: str, out_under_key: str, oname: str, price: float, lo: float, hi: float):
-        if not (lo <= price <= hi):
+    def set_ou(out_over_key: str, out_under_key: str, oname: str, price: float):
+        if not (OU_MIN <= price <= OU_MAX):
             return
         n = oname.lower()
         if "over" in n:
@@ -564,7 +620,7 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         outcomes_meta: Dict[int, str] = meta.get("outcomes") or {}
         outcomes = m.get("outcomes") or {}
 
-        # --- BTTS ---
+        # BTTS
         if mid == BTTS_MARKET_ID:
             for oid_str, o in outcomes.items():
                 try:
@@ -580,7 +636,7 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 if "no" in oname and BTTS_MIN <= price <= BTTS_MAX:
                     out["BTTS_N"] = price
 
-        # --- helper: handicap float ---
+        # handicap float
         h = None
         try:
             if hcap is not None:
@@ -588,7 +644,7 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         except:
             h = None
 
-        # --- Full Time O/U 2.5 ---
+        # Full Time OU 2.5
         if (OU_FT_NAME in mname) and (h == 2.5):
             for oid_str, o in outcomes.items():
                 try:
@@ -599,9 +655,9 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 if price is None:
                     continue
                 oname = outcomes_meta.get(oid, "") or ""
-                set_ou("O25", "U25", oname, price, OU_MIN, OU_MAX)
+                set_ou("O25", "U25", oname, price)
 
-        # --- Team totals: Team 1 ---
+        # Team 1 totals
         if (TEAM1_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
             for oid_str, o in outcomes.items():
                 try:
@@ -613,13 +669,13 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                     continue
                 oname = outcomes_meta.get(oid, "") or ""
                 if h == 0.5:
-                    set_ou("IT1_O05", "IT1_U05", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT1_O05", "IT1_U05", oname, price)
                 elif h == 1.5:
-                    set_ou("IT1_O15", "IT1_U15", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT1_O15", "IT1_U15", oname, price)
                 elif h == 2.5:
-                    set_ou("IT1_O25", "IT1_U25", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT1_O25", "IT1_U25", oname, price)
 
-        # --- Team totals: Team 2 ---
+        # Team 2 totals
         if (TEAM2_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
             for oid_str, o in outcomes.items():
                 try:
@@ -631,11 +687,11 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                     continue
                 oname = outcomes_meta.get(oid, "") or ""
                 if h == 0.5:
-                    set_ou("IT2_O05", "IT2_U05", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT2_O05", "IT2_U05", oname, price)
                 elif h == 1.5:
-                    set_ou("IT2_O15", "IT2_U15", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT2_O15", "IT2_U15", oname, price)
                 elif h == 2.5:
-                    set_ou("IT2_O25", "IT2_U25", oname, price, OU_MIN, OU_MAX)
+                    set_ou("IT2_O25", "IT2_U25", oname, price)
 
     return out
 
@@ -752,13 +808,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
         "Команды:\n"
-        "• /signals — value-сигналы (P≥75% и Value>0)\n"
-        "• /lines — линии/коэффы на все матчи (без фильтра value)\n"
-        "• /check — диагностика odds\n"
-        "• /odds_debug — debug рынка\n"
+        "• /signals — value-сигналы (включая ИТ)\n"
+        "• /lines — линии/коэффы по матчам (без фильтра value)\n"
         "• /oddspapi_account — проверка ключа Oddspapi\n"
         "• /reload_leagues — пересканировать лиги API-Football\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
+        f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
     )
 
 async def oddspapi_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -786,128 +841,9 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in chunked(text):
         await update.message.reply_text(part)
 
-async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures, _, _, used_date = get_today_matches_filtered()
-    if not fixtures:
-        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет (API-Football).")
-        return
-
-    try:
-        odds_map, odds_index = build_oddspapi_for_day(used_date)
-        markets_meta = get_markets_meta(force=False)
-    except Exception as e:
-        await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
-        return
-
-    sample = fixtures[:15]
-    matched, with_markets = 0, 0
-
-    for f in sample:
-        fixture = f.get("fixture") or {}
-        ts = int(fixture.get("timestamp") or 0)
-        ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp()) if ts else 0
-        home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-        away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-
-        it = match_odds_for_fixture(used_date, ts_msk, home, away, odds_map, odds_index)
-        if it:
-            matched += 1
-            odds = parse_odds(it, markets_meta)
-            if any([
-                odds.get("O25"), odds.get("U25"),
-                odds.get("BTTS_Y"), odds.get("BTTS_N")
-            ]):
-                with_markets += 1
-
-    await update.message.reply_text(
-        f"🔎 CHECK ({used_date})\n"
-        f"Матчей (после фильтра лиг): {len(fixtures)}\n"
-        f"Проверено: {len(sample)}\n"
-        f"Сматчено (OddsPapi): {matched}/{len(sample)}\n"
-        f"Сматчено и есть линии (OU/BTTS): {with_markets}/{len(sample)}\n"
-        f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
-    )
-
-async def odds_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fixtures, _, _, used_date = get_today_matches_filtered()
-    if not fixtures:
-        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет.")
-        return
-
-    try:
-        odds_map, odds_index = build_oddspapi_for_day(used_date)
-        markets_meta = get_markets_meta(force=False)
-    except Exception as e:
-        await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
-        return
-
-    matched_fixture = None
-    matched_item = None
-
-    for f in fixtures:
-        fixture = f.get("fixture") or {}
-        ts = int(fixture.get("timestamp") or 0)
-        ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp()) if ts else 0
-        home = ((f.get("teams") or {}).get("home") or {}).get("name", "")
-        away = ((f.get("teams") or {}).get("away") or {}).get("name", "")
-        it = match_odds_for_fixture(used_date, ts_msk, home, away, odds_map, odds_index)
-        if it:
-            matched_fixture = f
-            matched_item = it
-            break
-
-    if not matched_item:
-        await update.message.reply_text("❌ Не нашёл ни одного сматченного матча для odds_debug.")
-        return
-
-    home = ((matched_fixture.get("teams") or {}).get("home") or {}).get("name", "")
-    away = ((matched_fixture.get("teams") or {}).get("away") or {}).get("name", "")
-
-    bm = ((matched_item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
-    markets = bm.get("markets") or {}
-
-    lines = [
-        f"🧪 ODDS DEBUG ({used_date})\n{home} — {away}\nBookmaker: {ODDSPAPI_BOOKMAKER}\n",
-        f"fixtureId: {matched_item.get('fixtureId')}\nstartTime: {matched_item.get('startTime')}\nmarkets: {len(markets)}\n\n",
-        "format: marketId (marketName h=handicap) | outcomeId (outcomeName) | price\n\n",
-    ]
-
-    def p0_price(players_obj: Dict[str, Any]) -> Optional[float]:
-        p0 = players_obj.get("0") or players_obj.get(0) or {}
-        try:
-            return float(p0.get("price"))
-        except:
-            return None
-
-    shown = 0
-    for mid_str, m in markets.items():
-        try:
-            mid = int(mid_str)
-        except:
-            continue
-        meta = markets_meta.get(mid, {})
-        mname = meta.get("name", "?")
-        hcap = meta.get("handicap", "")
-        outcomes = m.get("outcomes") or {}
-        for oid_str, o in outcomes.items():
-            try:
-                oid = int(oid_str)
-            except:
-                continue
-            oname = (meta.get("outcomes") or {}).get(oid, "?")
-            price = p0_price(o.get("players") or {})
-            if price is None:
-                continue
-            lines.append(f"m={mid} ({mname} h={hcap}) | o={oid} ({oname}) | price={price}\n")
-            shown += 1
-            if shown >= 140:
-                break
-        if shown >= 140:
-            break
-
-    for part in chunked("".join(lines)):
-        await update.message.reply_text(part)
-
+# -----------------------------------------------------
+# /lines (без value)
+# -----------------------------------------------------
 async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
@@ -942,8 +878,6 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         o = parse_odds(it, markets_meta)
-
-        # если вообще нет рынков OU/BTTS/IT — пропускаем
         if not any(v is not None for v in o.values()):
             continue
 
@@ -954,10 +888,8 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 {t_str}\n"
             f"ТБ 2.5: {fmt_odds(o['O25'])} | ТМ 2.5: {fmt_odds(o['U25'])}\n"
             f"ОЗ Да: {fmt_odds(o['BTTS_Y'])} | ОЗ Нет: {fmt_odds(o['BTTS_N'])}\n"
-            f"ИТ1 >0.5: {fmt_odds(o['IT1_O05'])} | ИТ1 >1.5: {fmt_odds(o['IT1_O15'])} | ИТ1 >2.5: {fmt_odds(o['IT1_O25'])}\n"
-            f"ИТ1 <0.5: {fmt_odds(o['IT1_U05'])} | ИТ1 <1.5: {fmt_odds(o['IT1_U15'])} | ИТ1 <2.5: {fmt_odds(o['IT1_U25'])}\n"
-            f"ИТ2 >0.5: {fmt_odds(o['IT2_O05'])} | ИТ2 >1.5: {fmt_odds(o['IT2_O15'])} | ИТ2 >2.5: {fmt_odds(o['IT2_O25'])}\n"
-            f"ИТ2 <0.5: {fmt_odds(o['IT2_U05'])} | ИТ2 <1.5: {fmt_odds(o['IT2_U15'])} | ИТ2 <2.5: {fmt_odds(o['IT2_U25'])}\n"
+            f"ИТ1 >0.5: {fmt_odds(o['IT1_O05'])} | >1.5: {fmt_odds(o['IT1_O15'])} | >2.5: {fmt_odds(o['IT1_O25'])}\n"
+            f"ИТ2 >0.5: {fmt_odds(o['IT2_O05'])} | >1.5: {fmt_odds(o['IT2_O15'])} | >2.5: {fmt_odds(o['IT2_O25'])}\n"
             "\n"
         )
 
@@ -967,15 +899,15 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = ["(продолжение)\n\n"]
 
     if sent == 0:
-        await update.message.reply_text(
-            f"📭 На дату {used_date} не нашёл линий у {ODDSPAPI_BOOKMAKER} после сматчинга.\n"
-            "Проверь /check или /odds_debug."
-        )
+        await update.message.reply_text(f"📭 На дату {used_date} не нашёл линий у {ODDSPAPI_BOOKMAKER}.")
         return
 
     if msg:
         await update.message.reply_text("".join(msg))
 
+# -----------------------------------------------------
+# /signals (с IT value)
+# -----------------------------------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
@@ -992,6 +924,16 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nOdds: {ODDSPAPI_BOOKMAKER}\n\n"]
     found_any = 0
     batch = 0
+
+    def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
+        if book is None:
+            return None
+        if p < MIN_PROB:
+            return None
+        v = value_ev(p, book)
+        if v <= MIN_VALUE:
+            return None
+        return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
 
     for f in fixtures:
         fixture = f.get("fixture") or {}
@@ -1015,15 +957,14 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         odds = parse_odds(it, markets_meta)
-        if not any([odds.get("O25"), odds.get("U25"), odds.get("BTTS_Y"), odds.get("BTTS_N")]):
-            continue
 
         venue = fixture.get("venue") or {}
         city = venue.get("city")
         w_k = weather_factor(city)
 
-        hs = analyze_goals(get_last_matches(int(home_id), last=5))
-        as_ = analyze_goals(get_last_matches(int(away_id), last=5))
+        # ---- Общие вероятности (OU2.5 + BTTS) ----
+        hs = analyze_goals(get_last_matches(int(home_id), last=LAST_MATCHES_TOTAL))
+        as_ = analyze_goals(get_last_matches(int(away_id), last=LAST_MATCHES_TOTAL))
         if not hs or not as_:
             continue
 
@@ -1032,26 +973,74 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p_btts_y = prob_btts_yes(hs, as_, w_k)
         p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
 
-        def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
-            if book is None:
-                return None
-            if p < MIN_PROB:
-                return None
-            v = value_ev(p, book)
-            if v <= MIN_VALUE:
-                return None
-            return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
+        # ---- Индивидуальные тоталы (Poisson по λ) ----
+        home_stats = team_goal_stats(int(home_id), last=LAST_MATCHES_TEAM)
+        away_stats = team_goal_stats(int(away_id), last=LAST_MATCHES_TEAM)
 
-        lines_out = []
+        lam_home = None
+        lam_away = None
+        if home_stats and away_stats:
+            lam_home = max(0.05, (home_stats["scored"] + away_stats["conceded"]) / 2.0) * w_k
+            lam_away = max(0.05, (away_stats["scored"] + home_stats["conceded"]) / 2.0) * w_k
+
+        lines_out: List[str] = []
+
+        # основные рынки
         for title, p, book in [
-            ("ТБ 2.5", p_o25, odds["O25"]),
-            ("ТМ 2.5", p_u25, odds["U25"]),
-            ("ОЗ Да", p_btts_y, odds["BTTS_Y"]),
-            ("ОЗ Нет", p_btts_n, odds["BTTS_N"]),
+            ("ТБ 2.5", p_o25, odds.get("O25")),
+            ("ТМ 2.5", p_u25, odds.get("U25")),
+            ("ОЗ Да", p_btts_y, odds.get("BTTS_Y")),
+            ("ОЗ Нет", p_btts_n, odds.get("BTTS_N")),
         ]:
             ml = market_line(title, p, book)
             if ml:
                 lines_out.append(ml)
+
+        # IT рынки: берем только те, где есть коэффициент
+        if lam_home is not None and lam_away is not None:
+            # IT1
+            it1 = [
+                (0.5, "ИТ1 >0.5", "IT1_O05", "IT1_U05"),
+                (1.5, "ИТ1 >1.5", "IT1_O15", "IT1_U15"),
+                (2.5, "ИТ1 >2.5", "IT1_O25", "IT1_U25"),
+            ]
+            for line, label_over, key_over, key_under in it1:
+                book_over = odds.get(key_over)
+                book_under = odds.get(key_under)
+
+                if book_over is not None:
+                    p = prob_over_line_poisson(lam_home, line)
+                    ml = market_line(label_over, p, book_over)
+                    if ml:
+                        lines_out.append(ml)
+
+                if book_under is not None:
+                    p = prob_under_line_poisson(lam_home, line)
+                    ml = market_line(label_over.replace(">", "<"), p, book_under)
+                    if ml:
+                        lines_out.append(ml)
+
+            # IT2
+            it2 = [
+                (0.5, "ИТ2 >0.5", "IT2_O05", "IT2_U05"),
+                (1.5, "ИТ2 >1.5", "IT2_O15", "IT2_U15"),
+                (2.5, "ИТ2 >2.5", "IT2_O25", "IT2_U25"),
+            ]
+            for line, label_over, key_over, key_under in it2:
+                book_over = odds.get(key_over)
+                book_under = odds.get(key_under)
+
+                if book_over is not None:
+                    p = prob_over_line_poisson(lam_away, line)
+                    ml = market_line(label_over, p, book_over)
+                    if ml:
+                        lines_out.append(ml)
+
+                if book_under is not None:
+                    p = prob_under_line_poisson(lam_away, line)
+                    ml = market_line(label_over.replace(">", "<"), p, book_under)
+                    if ml:
+                        lines_out.append(ml)
 
         if not lines_out:
             continue
@@ -1074,7 +1063,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📭 На дату {used_date} нет value-сигналов при порогах:\n"
             f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n\n"
-            "Если хочешь просто видеть коэффициенты — используй /lines."
+            "Подсказка: /lines покажет просто коэффициенты без фильтра."
         )
         return
 
@@ -1089,8 +1078,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("lines", lines))
-    app.add_handler(CommandHandler("check", check))
-    app.add_handler(CommandHandler("odds_debug", odds_debug))
     app.add_handler(CommandHandler("oddspapi_account", oddspapi_account))
     app.add_handler(CommandHandler("reload_leagues", reload_leagues))
     app.run_polling()
