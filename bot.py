@@ -37,8 +37,21 @@ STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit fixed
 LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # fallback if lambdas missing
 LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # lambdas + IT
 
-OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.05")), float(os.getenv("OU_ODDS_MAX", "50.0"))
-BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.05")), float(os.getenv("BTTS_ODDS_MAX", "50.0"))
+# -------------------------
+# Anti-anomalies
+# -------------------------
+ANOMALY_VALUE_WARN = float(os.getenv("ANOMALY_VALUE_WARN", "0.50"))
+
+# "Hard sanity" odds ranges by market group.
+# Если коэффициент выходит за диапазон — помечаем как подозрительный и НЕ пишем в статистику.
+SANITY_OU_MIN = float(os.getenv("SANITY_OU_MIN", "1.05"))
+SANITY_OU_MAX = float(os.getenv("SANITY_OU_MAX", "6.00"))
+
+SANITY_BTTS_MIN = float(os.getenv("SANITY_BTTS_MIN", "1.05"))
+SANITY_BTTS_MAX = float(os.getenv("SANITY_BTTS_MAX", "6.00"))
+
+SANITY_IT_MIN = float(os.getenv("SANITY_IT_MIN", "1.05"))
+SANITY_IT_MAX = float(os.getenv("SANITY_IT_MAX", "10.00"))
 
 STATE_FILE = "state.json"
 DB_FILE = "cerber.db"
@@ -306,6 +319,34 @@ def fmt_odds(x: Optional[float]) -> str:
 def is_cup_like(league_name: str) -> bool:
     s = (league_name or "").lower()
     return any(k in s for k in ["cup", "copa", "coppa", "pokal", "shield", "super", "champions league", "europa league"])
+
+# =====================================================
+# Anti-anomaly #2: odds sanity check
+# =====================================================
+def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
+    """
+    Возвращает (ok, warn_text)
+    ok=False => коэффициент подозрителен для этого рынка.
+    """
+    if book is None or not isinstance(book, (int, float)):
+        return False, "⚠️ подозрительная линия (odds)"
+
+    book = float(book)
+
+    if market_code in {"O25", "U25"}:
+        ok = (SANITY_OU_MIN <= book <= SANITY_OU_MAX)
+        return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
+
+    if market_code in {"BTTS_Y", "BTTS_N"}:
+        ok = (SANITY_BTTS_MIN <= book <= SANITY_BTTS_MAX)
+        return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
+
+    if market_code.startswith("IT1_") or market_code.startswith("IT2_"):
+        ok = (SANITY_IT_MIN <= book <= SANITY_IT_MAX)
+        return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
+
+    # если рынок неизвестный — не считаем подозрительным
+    return True, ""
 
 # =====================================================
 # Weather (optional)
@@ -857,8 +898,6 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
             return None
 
     def set_ou(over_key: str, under_key: str, oname: str, price: float):
-        if not (OU_MIN <= price <= OU_MAX):
-            return
         n = oname.lower()
         if "over" in n:
             out[over_key] = price
@@ -888,9 +927,9 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 if price is None:
                     continue
                 on = (outcomes_meta.get(oid, "") or "").lower()
-                if "yes" in on and BTTS_MIN <= price <= BTTS_MAX:
+                if "yes" in on:
                     out["BTTS_Y"] = price
-                if "no" in on and BTTS_MIN <= price <= BTTS_MAX:
+                if "no" in on:
                     out["BTTS_N"] = price
 
         # handicap float
@@ -1202,6 +1241,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /reload_leagues — пересканировать лиги\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
+        f"Анти-анома Value: >{ANOMALY_VALUE_WARN:+.2f} → ⚠️\n"
         f"Stake: {STAKE:.2f} unit\n"
     )
 
@@ -1347,7 +1387,7 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("".join(msg))
 
 # ---------------------------
-# /signals (value + factors + Model λ)
+# /signals (value + factors + Model λ + anti-anomalies)
 # ---------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -1371,32 +1411,49 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         p: float, book: Optional[float]) -> Optional[str]:
         if book is None:
             return None
+
+        # ---- Anti-anomaly #2 (odds sanity) ----
+        ok_odds, odds_warn = odds_sanity(market_code, float(book))
+        # (мы покажем предупреждение, но не будем сохранять в БД если ok_odds=False)
+
+        # фильтр на P / value
         if p < MIN_PROB:
             return None
-        v = value_ev(p, book)
+
+        v = value_ev(p, float(book))
         if v <= MIN_VALUE:
             return None
 
         fair = fair_odds(p)
-        text = f"{market_label}: P={int(p*100)}% | Book={book:.2f} | Fair={fair:.2f} | Value={v:+.2f}"
 
-        db_upsert_signal({
-            "created_at": datetime.utcnow().isoformat(),
-            "match_date": match_date,
-            "fixture_id": fixture_id,
-            "league": league,
-            "home": home,
-            "away": away,
-            "market_code": market_code,
-            "market_label": market_label,
-            "line": line,
-            "side": side,
-            "p_model": p,
-            "book_odds": book,
-            "fair_odds": fair,
-            "value_ev": v,
-            "stake": STAKE,
-        })
+        # ---- Anti-anomaly #1 (too big value) ----
+        value_warn = "⚠️ проверь линию вручную" if v > ANOMALY_VALUE_WARN else ""
+
+        warns = " ".join([w for w in [value_warn, odds_warn] if w]).strip()
+        warns = f" {warns}" if warns else ""
+
+        text = f"{market_label}: P={int(p*100)}% | Book={float(book):.2f} | Fair={fair:.2f} | Value={v:+.2f}{warns}"
+
+        # сохраняем ТОЛЬКО если odds не подозрительные
+        if ok_odds:
+            db_upsert_signal({
+                "created_at": datetime.utcnow().isoformat(),
+                "match_date": match_date,
+                "fixture_id": fixture_id,
+                "league": league,
+                "home": home,
+                "away": away,
+                "market_code": market_code,
+                "market_label": market_label,
+                "line": line,
+                "side": side,
+                "p_model": p,
+                "book_odds": float(book),
+                "fair_odds": fair,
+                "value_ev": v,
+                "stake": STAKE,
+            })
+
         return text
 
     for f in fixtures:
@@ -1459,7 +1516,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines_out: List[str] = []
 
-        # main markets
         for market_code, label, p, book, line, side in [
             ("O25", "ТБ 2.5", p_o25, odds.get("O25"), 2.5, "O"),
             ("U25", "ТМ 2.5", p_u25, odds.get("U25"), 2.5, "U"),
@@ -1471,7 +1527,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if s:
                 lines_out.append(s)
 
-        # individual totals only when lambdas exist
         if used_poisson and lam_home is not None and lam_away is not None:
             it_specs = [
                 (0.5, "IT1_O05", "ИТ1 >0.5", "O", lam_home),
