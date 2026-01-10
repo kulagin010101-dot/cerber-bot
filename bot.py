@@ -2,6 +2,7 @@ import os
 import json
 import time
 import math
+import sqlite3
 import unicodedata
 import requests
 from datetime import datetime, timedelta
@@ -16,7 +17,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 ODDSPAPI_KEY = os.getenv("ODDSPAPI_KEY")
-ODDSPAPI_BOOKMAKER = os.getenv("ODDSPAPI_BOOKMAKER", "1xbet")  # твой тариф: 1xBet
+ODDSPAPI_BOOKMAKER = os.getenv("ODDSPAPI_BOOKMAKER", "1xbet")
 WEATHER_KEY = os.getenv("WEATHER_API_KEY")  # optional
 
 if not BOT_TOKEN:
@@ -29,18 +30,18 @@ if not ODDSPAPI_KEY:
 HEADERS_FOOTBALL = {"x-apisports-key": FOOTBALL_API_KEY}
 
 SEASON = int(os.getenv("SEASON", "2025"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))   # 75%
-MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00")) # value > 0
+MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))     # 75%
+MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))   # value > 0
+STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit фикс
 
-# сколько матчей брать для модели (можно менять env)
-LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))     # для общих (ТБ/ТМ, ОЗ)
-LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))       # для ИТ
+LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # OU/BTTS
+LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # IT
 
-# sanity filters for odds
 OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.05")), float(os.getenv("OU_ODDS_MAX", "20.0"))
 BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.05")), float(os.getenv("BTTS_ODDS_MAX", "20.0"))
 
 STATE_FILE = "state.json"
+DB_FILE = "cerber.db"
 
 # =====================================================
 # TARGET TOURNAMENTS (Oddspapi)
@@ -129,6 +130,143 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # =====================================================
+# DB
+# =====================================================
+def db_connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_FILE)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+def db_init() -> None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      created_at TEXT NOT NULL,
+      match_date TEXT NOT NULL,
+      fixture_id INTEGER NOT NULL,
+      league TEXT,
+      home TEXT,
+      away TEXT,
+      market_code TEXT NOT NULL,
+      market_label TEXT NOT NULL,
+      line REAL,
+      side TEXT,
+      p_model REAL NOT NULL,
+      book_odds REAL NOT NULL,
+      fair_odds REAL NOT NULL,
+      value_ev REAL NOT NULL,
+      stake REAL NOT NULL,
+      status TEXT NOT NULL DEFAULT 'PENDING',
+      result TEXT,
+      profit REAL,
+      settled_at TEXT
+    );
+    """)
+    cur.execute("""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_signals_fixture_market
+    ON signals(fixture_id, market_code);
+    """)
+    con.commit()
+    con.close()
+
+def db_upsert_signal(payload: Dict[str, Any]) -> None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+    INSERT OR IGNORE INTO signals (
+      created_at, match_date, fixture_id, league, home, away,
+      market_code, market_label, line, side,
+      p_model, book_odds, fair_odds, value_ev, stake,
+      status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+    """, (
+        payload["created_at"], payload["match_date"], payload["fixture_id"],
+        payload.get("league"), payload.get("home"), payload.get("away"),
+        payload["market_code"], payload["market_label"], payload.get("line"),
+        payload.get("side"),
+        float(payload["p_model"]), float(payload["book_odds"]), float(payload["fair_odds"]),
+        float(payload["value_ev"]), float(payload["stake"]),
+    ))
+    con.commit()
+    con.close()
+
+def db_fetch_pending(limit: int = 60) -> List[Dict[str, Any]]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+      SELECT * FROM signals
+      WHERE status='PENDING'
+      ORDER BY match_date ASC
+      LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+def db_settle_signal(sig_id: int, result: str, profit: float) -> None:
+    con = db_connect()
+    cur = con.cursor()
+    cur.execute("""
+      UPDATE signals
+      SET status='SETTLED', result=?, profit=?, settled_at=?
+      WHERE id=?
+    """, (result, float(profit), datetime.utcnow().isoformat(), sig_id))
+    con.commit()
+    con.close()
+
+def db_stats(days: Optional[int]) -> Dict[str, Any]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    if days is None:
+        cur.execute("""
+          SELECT status, result, profit, stake FROM signals
+          WHERE status='SETTLED'
+        """)
+    else:
+        since = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cur.execute("""
+          SELECT status, result, profit, stake FROM signals
+          WHERE status='SETTLED' AND settled_at >= ?
+        """, (since,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+
+    n = len(rows)
+    wins = sum(1 for r in rows if r.get("result") == "WIN")
+    loses = sum(1 for r in rows if r.get("result") == "LOSE")
+    pushes = sum(1 for r in rows if r.get("result") == "PUSH")
+    stake_sum = sum(float(r.get("stake") or 0.0) for r in rows)
+    profit_sum = sum(float(r.get("profit") or 0.0) for r in rows)
+
+    hit = (wins / (wins + loses)) if (wins + loses) > 0 else 0.0
+    roi = (profit_sum / stake_sum * 100.0) if stake_sum > 0 else 0.0
+
+    return {
+        "n": n, "wins": wins, "loses": loses, "pushes": pushes,
+        "stake_sum": stake_sum, "profit_sum": profit_sum,
+        "hit": hit, "roi": roi
+    }
+
+def db_last_history(limit: int = 20) -> List[Dict[str, Any]]:
+    con = db_connect()
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    cur.execute("""
+      SELECT created_at, match_date, league, home, away, market_label, book_odds, p_model, value_ev, result, profit
+      FROM signals
+      ORDER BY id DESC
+      LIMIT ?
+    """, (limit,))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+# =====================================================
 # Helpers
 # =====================================================
 def safe_team_key(name: str) -> str:
@@ -136,19 +274,9 @@ def safe_team_key(name: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     repl = {
-        "&": "and",
-        "’": "'",
-        ".": "",
-        ",": "",
-        "-": " ",
-        " fc": "",
-        "fc ": "",
-        " cf": "",
-        "cf ": "",
-        " sc": "",
-        "sc ": "",
-        " ac": "",
-        "ac ": "",
+        "&": "and", "’": "'",
+        ".": "", ",": "", "-": " ",
+        " fc": "", "fc ": "", " cf": "", "cf ": "", " sc": "", "sc ": "", " ac": "", "ac ": "",
     }
     for a, b in repl.items():
         s = s.replace(a, b)
@@ -216,7 +344,7 @@ def weather_factor(city: Optional[str]) -> float:
         return 1.0
 
 # =====================================================
-# API-Football: last matches
+# API-Football: last matches + stats
 # =====================================================
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
@@ -231,14 +359,13 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
     except:
         return []
 
-# --- totals / btts stats ---
 def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
     total_goals = 0.0
     btts_yes = 0.0
     over25 = 0.0
     n = 0.0
     for m in matches:
-        goals = m.get("goals", {})
+        goals = m.get("goals", {}) or {}
         h, a = goals.get("home"), goals.get("away")
         if h is None or a is None:
             continue
@@ -256,14 +383,10 @@ def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
 def prob_over25(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
     p = 0.60
     base = (hs["avg"] + as_["avg"]) / 2.0
-    if base >= 2.6:
-        p += 0.08
-    if hs["over25"] >= 0.6:
-        p += 0.05
-    if as_["over25"] >= 0.6:
-        p += 0.05
-    if hs["btts"] >= 0.6 and as_["btts"] >= 0.6:
-        p += 0.04
+    if base >= 2.6: p += 0.08
+    if hs["over25"] >= 0.6: p += 0.05
+    if as_["over25"] >= 0.6: p += 0.05
+    if hs["btts"] >= 0.6 and as_["btts"] >= 0.6: p += 0.04
     p *= w_k
     return clamp(p, 0.05, 0.90)
 
@@ -275,7 +398,6 @@ def prob_btts_yes(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> fl
     p *= w_k
     return clamp(p, 0.05, 0.90)
 
-# --- team scored/conceded stats (for Individual Totals) ---
 def team_goal_stats(team_id: int, last: int = 8) -> Optional[Dict[str, float]]:
     matches = get_last_matches(team_id, last=last)
     scored = 0.0
@@ -314,26 +436,23 @@ def poisson_pmf(k: int, lam: float) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 def poisson_cdf(k: int, lam: float) -> float:
-    # P(X <= k)
     s = 0.0
     for i in range(0, k + 1):
         s += poisson_pmf(i, lam)
     return min(max(s, 0.0), 1.0)
 
 def prob_over_line_poisson(lam: float, line: float) -> float:
-    # lines: 0.5 / 1.5 / 2.5 ...
-    k = int(math.floor(line))  # for 2.5 -> k=2, P(X>2)
+    k = int(math.floor(line))  # 2.5 -> 2
     p = 1.0 - poisson_cdf(k, lam)
     return clamp(p, 0.05, 0.95)
 
 def prob_under_line_poisson(lam: float, line: float) -> float:
-    # P(X < line+?) for 2.5 -> P(X<=2)
     k = int(math.floor(line))
     p = poisson_cdf(k, lam)
     return clamp(p, 0.05, 0.95)
 
 # =====================================================
-# API-Football: resolve league ids + today fixtures filtered
+# API-Football: leagues resolve + fixtures today filtered
 # =====================================================
 def leagues_search(search_text: str, country: Optional[str]) -> List[Dict[str, Any]]:
     params = {"search": search_text}
@@ -356,12 +475,9 @@ def score_candidate(target_country: Optional[str], aliases: List[str], cand_name
         score += 50 if tc == target_country.strip().lower() else -10
     for a in aliases:
         al = a.strip().lower()
-        if tn == al:
-            score += 100
-        elif al in tn:
-            score += 60
-        elif tn in al:
-            score += 40
+        if tn == al: score += 100
+        elif al in tn: score += 60
+        elif tn in al: score += 40
     return score
 
 def resolve_target_league_ids(force: bool = False) -> Tuple[Dict[str, int], List[str]]:
@@ -448,7 +564,7 @@ def get_today_matches_filtered() -> Tuple[List[Dict[str, Any]], Dict[str, int], 
     return [], league_ids, missing, date_msk
 
 # =====================================================
-# OddsPapi helpers
+# OddsPapi
 # =====================================================
 def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
     params = dict(params)
@@ -471,7 +587,6 @@ def oddspapi_get(path: str, params: Dict[str, Any]) -> Any:
 
     raise RuntimeError("OddsPapi: слишком много 429 подряд, попробуй позже.")
 
-# ---- participants cache ----
 PART_CACHE_KEY = "oddspapi_participants_10"
 PART_CACHE_DATE = "oddspapi_participants_10_date"
 
@@ -486,7 +601,6 @@ def get_participants_map(force: bool = False) -> Dict[str, str]:
     save_state(STATE)
     return pm
 
-# ---- tournaments cache ----
 TOURN_CACHE_KEY = "oddspapi_tournaments_10"
 TOURN_CACHE_DATE = "oddspapi_tournaments_10_date"
 
@@ -530,7 +644,6 @@ def fetch_oddspapi_odds_by_tournaments(tournament_ids: List[int]) -> List[Dict[s
         time.sleep(0.08)
     return all_items
 
-# ---- markets meta cache ----
 MARKETS_CACHE_KEY = "oddspapi_markets"
 MARKETS_CACHE_DATE = "oddspapi_markets_date"
 
@@ -558,11 +671,7 @@ def get_markets_meta(force: bool = False) -> Dict[int, Dict[str, Any]]:
             except:
                 pass
 
-        meta[mid] = {
-            "name": str(m.get("marketName") or ""),
-            "handicap": m.get("handicap"),
-            "outcomes": outs,
-        }
+        meta[mid] = {"name": str(m.get("marketName") or ""), "handicap": m.get("handicap"), "outcomes": outs}
 
     STATE[MARKETS_CACHE_KEY] = {str(k): v for k, v in meta.items()}
     STATE[MARKETS_CACHE_DATE] = today
@@ -570,7 +679,7 @@ def get_markets_meta(force: bool = False) -> Dict[int, Dict[str, Any]]:
     return meta
 
 # =====================================================
-# Odds parsing: OU2.5 + BTTS + Team Totals
+# Odds parsing (OU2.5 + BTTS + IT lines)
 # =====================================================
 BTTS_MARKET_ID = 104
 OU_FT_NAME = "over under full time"
@@ -599,14 +708,14 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         except:
             return None
 
-    def set_ou(out_over_key: str, out_under_key: str, oname: str, price: float):
+    def set_ou(over_key: str, under_key: str, oname: str, price: float):
         if not (OU_MIN <= price <= OU_MAX):
             return
         n = oname.lower()
         if "over" in n:
-            out[out_over_key] = price
+            out[over_key] = price
         elif "under" in n:
-            out[out_under_key] = price
+            out[under_key] = price
 
     for mid_str, m in markets.items():
         try:
@@ -630,10 +739,10 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 price = price_from_players(o.get("players") or {})
                 if price is None:
                     continue
-                oname = (outcomes_meta.get(oid, "") or "").lower()
-                if "yes" in oname and BTTS_MIN <= price <= BTTS_MAX:
+                on = (outcomes_meta.get(oid, "") or "").lower()
+                if "yes" in on and BTTS_MIN <= price <= BTTS_MAX:
                     out["BTTS_Y"] = price
-                if "no" in oname and BTTS_MIN <= price <= BTTS_MAX:
+                if "no" in on and BTTS_MIN <= price <= BTTS_MAX:
                     out["BTTS_N"] = price
 
         # handicap float
@@ -657,7 +766,7 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 oname = outcomes_meta.get(oid, "") or ""
                 set_ou("O25", "U25", oname, price)
 
-        # Team 1 totals
+        # Team totals (0.5/1.5/2.5)
         if (TEAM1_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
             for oid_str, o in outcomes.items():
                 try:
@@ -668,14 +777,10 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 if price is None:
                     continue
                 oname = outcomes_meta.get(oid, "") or ""
-                if h == 0.5:
-                    set_ou("IT1_O05", "IT1_U05", oname, price)
-                elif h == 1.5:
-                    set_ou("IT1_O15", "IT1_U15", oname, price)
-                elif h == 2.5:
-                    set_ou("IT1_O25", "IT1_U25", oname, price)
+                if h == 0.5: set_ou("IT1_O05", "IT1_U05", oname, price)
+                if h == 1.5: set_ou("IT1_O15", "IT1_U15", oname, price)
+                if h == 2.5: set_ou("IT1_O25", "IT1_U25", oname, price)
 
-        # Team 2 totals
         if (TEAM2_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
             for oid_str, o in outcomes.items():
                 try:
@@ -686,17 +791,14 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
                 if price is None:
                     continue
                 oname = outcomes_meta.get(oid, "") or ""
-                if h == 0.5:
-                    set_ou("IT2_O05", "IT2_U05", oname, price)
-                elif h == 1.5:
-                    set_ou("IT2_O15", "IT2_U15", oname, price)
-                elif h == 2.5:
-                    set_ou("IT2_O25", "IT2_U25", oname, price)
+                if h == 0.5: set_ou("IT2_O05", "IT2_U05", oname, price)
+                if h == 1.5: set_ou("IT2_O15", "IT2_U15", oname, price)
+                if h == 2.5: set_ou("IT2_O25", "IT2_U25", oname, price)
 
     return out
 
 # =====================================================
-# Odds cache (60 sec) + index for fuzzy matching
+# Odds cache + matching
 # =====================================================
 ODDS_CACHE_KEY = "odds_cache"
 ODDS_CACHE_TS = "odds_cache_ts"
@@ -802,18 +904,105 @@ def match_odds_for_fixture(date_msk: str, fixture_ts_msk: int, home_name: str, a
     return None
 
 # =====================================================
+# Settlement via API-Football
+# =====================================================
+def fetch_fixtures_by_ids(ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """
+    Возвращает map fixture_id -> fixture_response_item (как API-Football fixtures response)
+    API-Football поддерживает несколько id через '-'
+    """
+    out: Dict[int, Dict[str, Any]] = {}
+    if not ids:
+        return out
+    CH = 20
+    for i in range(0, len(ids), CH):
+        chunk = ids[i:i+CH]
+        id_param = "-".join(str(x) for x in chunk)
+        try:
+            r = requests.get(
+                "https://v3.football.api-sports.io/fixtures",
+                headers=HEADERS_FOOTBALL,
+                params={"id": id_param},
+                timeout=25
+            )
+            r.raise_for_status()
+            resp = r.json().get("response", [])
+            for it in resp:
+                fx = it.get("fixture", {}) or {}
+                fid = fx.get("id")
+                if fid is not None:
+                    out[int(fid)] = it
+        except Exception as e:
+            print(f"[ERROR] fetch_fixtures_by_ids chunk failed: {e}")
+        time.sleep(0.08)
+    return out
+
+def is_finished_status(short: str) -> bool:
+    s = (short or "").upper()
+    return s in {"FT", "AET", "PEN"}  # финал, доп, пен.
+
+def settle_result_for_market(market_code: str, hg: int, ag: int) -> str:
+    """
+    Возвращает WIN/LOSE/PUSH.
+    Для наших линий с .5 push невозможен, но оставим.
+    """
+    total = hg + ag
+
+    # OU 2.5
+    if market_code == "O25":
+        return "WIN" if total >= 3 else "LOSE"
+    if market_code == "U25":
+        return "WIN" if total <= 2 else "LOSE"
+
+    # BTTS
+    if market_code == "BTTS_Y":
+        return "WIN" if (hg > 0 and ag > 0) else "LOSE"
+    if market_code == "BTTS_N":
+        return "WIN" if (hg == 0 or ag == 0) else "LOSE"
+
+    # IT1 / IT2 (0.5/1.5/2.5)
+    def parse_it(code: str) -> Tuple[str, float, str]:
+        # IT1_O15 -> team=1, side=O, line=1.5
+        team = "1" if code.startswith("IT1_") else "2"
+        side = "O" if "_O" in code else "U"
+        tail = code.split("_")[-1]  # O15 or U25
+        num = tail[1:]              # 15
+        line = float(num[0] + "." + num[1])  # 1.5
+        return team, line, side
+
+    if market_code.startswith("IT1_") or market_code.startswith("IT2_"):
+        team, line, side = parse_it(market_code)
+        tg = hg if team == "1" else ag
+        if side == "O":
+            return "WIN" if tg > line else "LOSE"
+        else:
+            return "WIN" if tg < line else "LOSE"  # для 1.5 это tg<=1
+    return "PUSH"
+
+def profit_for_result(result: str, odds: float, stake: float) -> float:
+    if result == "WIN":
+        return (odds - 1.0) * stake
+    if result == "LOSE":
+        return -1.0 * stake
+    return 0.0
+
+# =====================================================
 # Telegram commands
 # =====================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
         "Команды:\n"
-        "• /signals — value-сигналы (включая ИТ)\n"
-        "• /lines — линии/коэффы по матчам (без фильтра value)\n"
-        "• /oddspapi_account — проверка ключа Oddspapi\n"
-        "• /reload_leagues — пересканировать лиги API-Football\n\n"
+        "• /signals — value-сигналы (OU/BTTS + ИТ)\n"
+        "• /lines — линии (без фильтра)\n"
+        "• /settle — обновить результаты (win/lose) и ROI\n"
+        "• /roi — статистика ROI/проходимость\n"
+        "• /history — последние 20 сигналов\n"
+        "• /oddspapi_account — проверка ключа OddsPapi\n"
+        "• /reload_leagues — пересканировать лиги\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
+        f"Stake: {STAKE:.2f} unit\n"
     )
 
 async def oddspapi_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,7 +1019,6 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "✅ Найденные лиги:\n"
     for k in sorted(resolved.keys()):
         text += f"• {k} → ID {resolved[k]}\n"
-
     text += "\n❌ Не найдены:\n"
     if missing:
         for m in missing:
@@ -841,9 +1029,9 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in chunked(text):
         await update.message.reply_text(part)
 
-# -----------------------------------------------------
-# /lines (без value)
-# -----------------------------------------------------
+# ---------------------------
+# /lines
+# ---------------------------
 async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
@@ -889,8 +1077,7 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ТБ 2.5: {fmt_odds(o['O25'])} | ТМ 2.5: {fmt_odds(o['U25'])}\n"
             f"ОЗ Да: {fmt_odds(o['BTTS_Y'])} | ОЗ Нет: {fmt_odds(o['BTTS_N'])}\n"
             f"ИТ1 >0.5: {fmt_odds(o['IT1_O05'])} | >1.5: {fmt_odds(o['IT1_O15'])} | >2.5: {fmt_odds(o['IT1_O25'])}\n"
-            f"ИТ2 >0.5: {fmt_odds(o['IT2_O05'])} | >1.5: {fmt_odds(o['IT2_O15'])} | >2.5: {fmt_odds(o['IT2_O25'])}\n"
-            "\n"
+            f"ИТ2 >0.5: {fmt_odds(o['IT2_O05'])} | >1.5: {fmt_odds(o['IT2_O15'])} | >2.5: {fmt_odds(o['IT2_O25'])}\n\n"
         )
 
         batch += 1
@@ -905,9 +1092,9 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg:
         await update.message.reply_text("".join(msg))
 
-# -----------------------------------------------------
-# /signals (с IT value)
-# -----------------------------------------------------
+# ---------------------------
+# /signals (с записью в БД)
+# ---------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
     if not fixtures:
@@ -925,7 +1112,9 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_any = 0
     batch = 0
 
-    def market_line(title: str, p: float, book: Optional[float]) -> Optional[str]:
+    def try_emit_signal(fixture_id: int, match_date: str, league: str, home: str, away: str,
+                        market_code: str, market_label: str, line: Optional[float], side: Optional[str],
+                        p: float, book: Optional[float]) -> Optional[str]:
         if book is None:
             return None
         if p < MIN_PROB:
@@ -933,16 +1122,43 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v = value_ev(p, book)
         if v <= MIN_VALUE:
             return None
-        return f"{title}: P={int(p*100)}% | Book={book:.2f} | Fair={fair_odds(p):.2f} | Value={v:+.2f}"
+
+        fair = fair_odds(p)
+        text = f"{market_label}: P={int(p*100)}% | Book={book:.2f} | Fair={fair:.2f} | Value={v:+.2f}"
+
+        # запись в БД (insert ignore — не дублирует)
+        db_upsert_signal({
+            "created_at": datetime.utcnow().isoformat(),
+            "match_date": match_date,
+            "fixture_id": fixture_id,
+            "league": league,
+            "home": home,
+            "away": away,
+            "market_code": market_code,
+            "market_label": market_label,
+            "line": line,
+            "side": side,
+            "p_model": p,
+            "book_odds": book,
+            "fair_odds": fair,
+            "value_ev": v,
+            "stake": STAKE,
+        })
+        return text
 
     for f in fixtures:
         fixture = f.get("fixture") or {}
-        home = (f.get("teams") or {}).get("home", {}) or {}
-        away = (f.get("teams") or {}).get("away", {}) or {}
-        league = f.get("league", {}) or {}
+        teams = f.get("teams") or {}
+        home_t = teams.get("home") or {}
+        away_t = teams.get("away") or {}
+        league_obj = f.get("league") or {}
 
-        home_id = home.get("id")
-        away_id = away.get("id")
+        fixture_id = fixture.get("id")
+        if not fixture_id:
+            continue
+
+        home_id = home_t.get("id")
+        away_id = away_t.get("id")
         if not home_id or not away_id:
             continue
 
@@ -952,17 +1168,22 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts_msk = int((datetime.utcfromtimestamp(ts) + timedelta(hours=3)).timestamp())
         t_str = (datetime.utcfromtimestamp(ts) + timedelta(hours=3)).strftime("%H:%M МСК")
 
-        it = match_odds_for_fixture(used_date, ts_msk, home.get("name", ""), away.get("name", ""), odds_map, odds_index)
+        home_name = home_t.get("name", "?")
+        away_name = away_t.get("name", "?")
+        league_name = league_obj.get("name", "?")
+
+        it = match_odds_for_fixture(used_date, ts_msk, home_name, away_name, odds_map, odds_index)
         if not it:
             continue
 
         odds = parse_odds(it, markets_meta)
 
+        # weather factor
         venue = fixture.get("venue") or {}
         city = venue.get("city")
         w_k = weather_factor(city)
 
-        # ---- Общие вероятности (OU2.5 + BTTS) ----
+        # OU/BTTS probs
         hs = analyze_goals(get_last_matches(int(home_id), last=LAST_MATCHES_TOTAL))
         as_ = analyze_goals(get_last_matches(int(away_id), last=LAST_MATCHES_TOTAL))
         if not hs or not as_:
@@ -973,82 +1194,65 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p_btts_y = prob_btts_yes(hs, as_, w_k)
         p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
 
-        # ---- Индивидуальные тоталы (Poisson по λ) ----
+        # IT probs via poisson
         home_stats = team_goal_stats(int(home_id), last=LAST_MATCHES_TEAM)
         away_stats = team_goal_stats(int(away_id), last=LAST_MATCHES_TEAM)
-
-        lam_home = None
-        lam_away = None
+        lam_home = lam_away = None
         if home_stats and away_stats:
             lam_home = max(0.05, (home_stats["scored"] + away_stats["conceded"]) / 2.0) * w_k
             lam_away = max(0.05, (away_stats["scored"] + home_stats["conceded"]) / 2.0) * w_k
 
         lines_out: List[str] = []
 
-        # основные рынки
-        for title, p, book in [
-            ("ТБ 2.5", p_o25, odds.get("O25")),
-            ("ТМ 2.5", p_u25, odds.get("U25")),
-            ("ОЗ Да", p_btts_y, odds.get("BTTS_Y")),
-            ("ОЗ Нет", p_btts_n, odds.get("BTTS_N")),
+        # main
+        for market_code, label, p, book, line, side in [
+            ("O25", "ТБ 2.5", p_o25, odds.get("O25"), 2.5, "O"),
+            ("U25", "ТМ 2.5", p_u25, odds.get("U25"), 2.5, "U"),
+            ("BTTS_Y", "ОЗ Да", p_btts_y, odds.get("BTTS_Y"), None, "Y"),
+            ("BTTS_N", "ОЗ Нет", p_btts_n, odds.get("BTTS_N"), None, "N"),
         ]:
-            ml = market_line(title, p, book)
-            if ml:
-                lines_out.append(ml)
+            s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
+                                market_code, label, line, side, p, book)
+            if s:
+                lines_out.append(s)
 
-        # IT рынки: берем только те, где есть коэффициент
+        # IT
         if lam_home is not None and lam_away is not None:
-            # IT1
-            it1 = [
-                (0.5, "ИТ1 >0.5", "IT1_O05", "IT1_U05"),
-                (1.5, "ИТ1 >1.5", "IT1_O15", "IT1_U15"),
-                (2.5, "ИТ1 >2.5", "IT1_O25", "IT1_U25"),
+            it_specs = [
+                (0.5, "IT1_O05", "ИТ1 >0.5", "O"),
+                (1.5, "IT1_O15", "ИТ1 >1.5", "O"),
+                (2.5, "IT1_O25", "ИТ1 >2.5", "O"),
+                (0.5, "IT2_O05", "ИТ2 >0.5", "O"),
+                (1.5, "IT2_O15", "ИТ2 >1.5", "O"),
+                (2.5, "IT2_O25", "ИТ2 >2.5", "O"),
+                (0.5, "IT1_U05", "ИТ1 <0.5", "U"),
+                (1.5, "IT1_U15", "ИТ1 <1.5", "U"),
+                (2.5, "IT1_U25", "ИТ1 <2.5", "U"),
+                (0.5, "IT2_U05", "ИТ2 <0.5", "U"),
+                (1.5, "IT2_U15", "ИТ2 <1.5", "U"),
+                (2.5, "IT2_U25", "ИТ2 <2.5", "U"),
             ]
-            for line, label_over, key_over, key_under in it1:
-                book_over = odds.get(key_over)
-                book_under = odds.get(key_under)
+            for line, code, label, side in it_specs:
+                book = odds.get(code)
+                if book is None:
+                    continue
+                if code.startswith("IT1_"):
+                    p = prob_over_line_poisson(lam_home, line) if side == "O" else prob_under_line_poisson(lam_home, line)
+                else:
+                    p = prob_over_line_poisson(lam_away, line) if side == "O" else prob_under_line_poisson(lam_away, line)
 
-                if book_over is not None:
-                    p = prob_over_line_poisson(lam_home, line)
-                    ml = market_line(label_over, p, book_over)
-                    if ml:
-                        lines_out.append(ml)
-
-                if book_under is not None:
-                    p = prob_under_line_poisson(lam_home, line)
-                    ml = market_line(label_over.replace(">", "<"), p, book_under)
-                    if ml:
-                        lines_out.append(ml)
-
-            # IT2
-            it2 = [
-                (0.5, "ИТ2 >0.5", "IT2_O05", "IT2_U05"),
-                (1.5, "ИТ2 >1.5", "IT2_O15", "IT2_U15"),
-                (2.5, "ИТ2 >2.5", "IT2_O25", "IT2_U25"),
-            ]
-            for line, label_over, key_over, key_under in it2:
-                book_over = odds.get(key_over)
-                book_under = odds.get(key_under)
-
-                if book_over is not None:
-                    p = prob_over_line_poisson(lam_away, line)
-                    ml = market_line(label_over, p, book_over)
-                    if ml:
-                        lines_out.append(ml)
-
-                if book_under is not None:
-                    p = prob_under_line_poisson(lam_away, line)
-                    ml = market_line(label_over.replace(">", "<"), p, book_under)
-                    if ml:
-                        lines_out.append(ml)
+                s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
+                                    code, label, float(line), side, p, book)
+                if s:
+                    lines_out.append(s)
 
         if not lines_out:
             continue
 
         found_any += 1
         out.append(
-            f"🏆 {league.get('name','?')}\n"
-            f"{home.get('name','?')} — {away.get('name','?')}\n"
+            f"🏆 {league_name}\n"
+            f"{home_name} — {away_name}\n"
             f"🕒 {t_str}\n" +
             "\n".join(lines_out) +
             "\n\n"
@@ -1070,14 +1274,129 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if out:
         await update.message.reply_text("".join(out))
 
+# ---------------------------
+# /settle
+# ---------------------------
+async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = db_fetch_pending(limit=80)
+    if not pending:
+        await update.message.reply_text("✅ Нет PENDING сигналов. Всё рассчитано.")
+        return
+
+    # берём только матчи, которые уже должны быть сыграны (чтобы не дёргать API зря)
+    now = datetime.utcnow()
+    due = []
+    for s in pending:
+        try:
+            md = datetime.fromisoformat(s["match_date"])
+        except:
+            continue
+        # + 2 часа буфер
+        if md + timedelta(hours=2) <= now:
+            due.append(s)
+
+    if not due:
+        await update.message.reply_text("⏳ Пока нет матчей, которые уже точно завершились. Попробуй позже.")
+        return
+
+    fixture_ids = sorted(list(set(int(s["fixture_id"]) for s in due)))
+    fx_map = fetch_fixtures_by_ids(fixture_ids)
+
+    settled_count = 0
+    skipped_not_finished = 0
+
+    for s in due:
+        fid = int(s["fixture_id"])
+        fx = fx_map.get(fid)
+        if not fx:
+            continue
+
+        fixture = fx.get("fixture", {}) or {}
+        status = (fixture.get("status", {}) or {}).get("short", "")
+        if not is_finished_status(status):
+            skipped_not_finished += 1
+            continue
+
+        goals = fx.get("goals", {}) or {}
+        hg = goals.get("home")
+        ag = goals.get("away")
+        if hg is None or ag is None:
+            continue
+        hg = int(hg); ag = int(ag)
+
+        market_code = s["market_code"]
+        res = settle_result_for_market(market_code, hg, ag)
+        prof = profit_for_result(res, float(s["book_odds"]), float(s["stake"]))
+        db_settle_signal(int(s["id"]), res, prof)
+        settled_count += 1
+
+    await update.message.reply_text(
+        f"✅ SETTLE готово.\n"
+        f"Рассчитано: {settled_count}\n"
+        f"Ещё не завершились: {skipped_not_finished}"
+    )
+
+# ---------------------------
+# /roi
+# ---------------------------
+async def roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s7 = db_stats(7)
+    s30 = db_stats(30)
+    sall = db_stats(None)
+
+    def line(title: str, s: Dict[str, Any]) -> str:
+        return (
+            f"{title}\n"
+            f"• Ставок: {s['n']} (W {s['wins']} / L {s['loses']} / P {s['pushes']})\n"
+            f"• Проходимость: {int(s['hit']*100)}%\n"
+            f"• Profit: {s['profit_sum']:.2f}u на {s['stake_sum']:.2f}u\n"
+            f"• ROI: {s['roi']:.2f}%\n"
+        )
+
+    await update.message.reply_text(
+        "📈 ROI / Проходимость (фикс 1 unit)\n\n"
+        + line("🗓️ 7 дней:", s7) + "\n"
+        + line("🗓️ 30 дней:", s30) + "\n"
+        + line("🧾 Всё время:", sall)
+        + "\nПодсказка: сначала /settle, чтобы обновить результаты."
+    )
+
+# ---------------------------
+# /history
+# ---------------------------
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db_last_history(20)
+    if not rows:
+        await update.message.reply_text("Пока нет истории сигналов.")
+        return
+
+    msg = ["🧾 Последние сигналы:\n\n"]
+    for r in rows:
+        res = r.get("result") or "PENDING"
+        prof = r.get("profit")
+        prof_s = "—" if prof is None else f"{prof:+.2f}u"
+        msg.append(
+            f"{(r.get('league') or '?')} | {r.get('home') or '?'} — {r.get('away') or '?'}\n"
+            f"{r.get('market_label')} | Book={float(r.get('book_odds') or 0):.2f} | P={int(float(r.get('p_model') or 0)*100)}% | Value={float(r.get('value_ev') or 0):+.2f}\n"
+            f"Result: {res} | Profit: {prof_s}\n\n"
+        )
+
+    for part in chunked("".join(msg)):
+        await update.message.reply_text(part)
+
 # =====================================================
 # RUN
 # =====================================================
 def main():
+    db_init()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("signals", signals))
     app.add_handler(CommandHandler("lines", lines))
+    app.add_handler(CommandHandler("settle", settle))
+    app.add_handler(CommandHandler("roi", roi))
+    app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("oddspapi_account", oddspapi_account))
     app.add_handler(CommandHandler("reload_leagues", reload_leagues))
     app.run_polling()
