@@ -32,13 +32,13 @@ HEADERS_FOOTBALL = {"x-apisports-key": FOOTBALL_API_KEY}
 SEASON = int(os.getenv("SEASON", "2025"))
 MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))     # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))   # value > 0
-STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit фикс
+STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit fixed
 
 LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # fallback if lambdas missing
 LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # lambdas + IT
 
-OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.05")), float(os.getenv("OU_ODDS_MAX", "20.0"))
-BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.05")), float(os.getenv("BTTS_ODDS_MAX", "20.0"))
+OU_MIN, OU_MAX = float(os.getenv("OU_ODDS_MIN", "1.05")), float(os.getenv("OU_ODDS_MAX", "50.0"))
+BTTS_MIN, BTTS_MAX = float(os.getenv("BTTS_ODDS_MIN", "1.05")), float(os.getenv("BTTS_ODDS_MAX", "50.0"))
 
 STATE_FILE = "state.json"
 DB_FILE = "cerber.db"
@@ -412,11 +412,6 @@ def team_goal_stats(team_id: int, last: int = 8) -> Optional[Dict[str, float]]:
 # Factors: injuries / fatigue / motivation
 # =====================================================
 def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
-    """
-    team_id -> {att, def}
-    att: FW/MF absences (rough)
-    def: DF/GK absences (rough)
-    """
     out: Dict[int, Dict[str, int]] = {}
     try:
         j = football_get("/injuries", {"fixture": fixture_id}, timeout=25)
@@ -448,11 +443,6 @@ def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
     return out
 
 def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[int, Dict[str, int]], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
-    """
-    Light:
-    - each missing attacker: -2% to own attack (cap 3 => -6%)
-    - each missing defender/GK: +2% to opponent attack (cap 3 => +6%)
-    """
     h = injuries.get(int(home_id), {"att": 0, "def": 0})
     a = injuries.get(int(away_id), {"att": 0, "def": 0})
 
@@ -475,12 +465,6 @@ def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[in
     return lam_home2, lam_away2, why_h, why_a
 
 def get_fatigue_factor(team_id: int, match_ts_utc: int) -> Tuple[float, str, int]:
-    """
-    Matches finished in last 7 days (incl.):
-    0-1: 1.00
-    2: 0.97
-    3+: 0.95
-    """
     try:
         dt_match = datetime.utcfromtimestamp(int(match_ts_utc))
         dt_from = (dt_match - timedelta(days=7)).date().isoformat()
@@ -502,10 +486,6 @@ def get_fatigue_factor(team_id: int, match_ts_utc: int) -> Tuple[float, str, int
         return 1.00, "fatigue=0%", 0
 
 def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
-    """
-    team_id -> {'rank': int, 'points': int}
-    Cached daily
-    """
     key = f"standings_{league_id}_{SEASON}"
     today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
     cache = STATE.get(key)
@@ -543,27 +523,17 @@ def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
     return out
 
 def get_motivation_factor(league_name: str, league_id: Optional[int], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
-    """
-    Light:
-    - cup-like: +3% both
-    - standings-based: title/top4/survival within 3 pts => +3%
-    """
-    base_h = 1.00
-    base_a = 1.00
-    why_h = "mot=0%"
-    why_a = "mot=0%"
-
     if is_cup_like(league_name):
         return 1.03, 1.03, "mot(cup)=+3%", "mot(cup)=+3%"
 
     if not league_id:
-        return base_h, base_a, why_h, why_a
+        return 1.00, 1.00, "mot=0%", "mot=0%"
 
     smap = get_standings_map(int(league_id))
     h = smap.get(int(home_id))
     a = smap.get(int(away_id))
     if not h or not a:
-        return base_h, base_a, why_h, why_a
+        return 1.00, 1.00, "mot=0%", "mot=0%"
 
     rows = list(smap.values())
     rank_points = {int(r["rank"]): int(r["points"]) for r in rows if int(r.get("rank", 0)) > 0}
@@ -1165,7 +1135,6 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
     if not fixture_id or not home_id or not away_id or not ts:
         return None, None, "Factors: (no ids)", {}
 
-    # base lambdas from team stats
     home_stats = team_goal_stats(int(home_id), last=LAST_MATCHES_TEAM)
     away_stats = team_goal_stats(int(away_id), last=LAST_MATCHES_TEAM)
     if not home_stats or not away_stats:
@@ -1223,10 +1192,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
         "Команды:\n"
-        "• /signals — value-сигналы (OU2.5, BTTS, ИТ) + факторы\n"
+        "• /signals — value-сигналы (OU2.5, BTTS, ИТ) + факторы + Model λ\n"
         "• /lines — линии (без фильтра)\n"
         "• /factors — факторы на сегодня (или /factors 3)\n"
-        "• /settle — посчитать результаты и ROI\n"
+        "• /settle — посчитать результаты\n"
         "• /roi — ROI/проходимость\n"
         "• /history — последние 20 сигналов\n"
         "• /oddspapi_account — проверка ключа OddsPapi\n"
@@ -1276,7 +1245,6 @@ async def factors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             idx = None
 
-    # sort by kickoff
     def key_ts(fx): return int((fx.get("fixture") or {}).get("timestamp") or 0)
     fixtures_sorted = sorted(fixtures, key=key_ts)
 
@@ -1297,7 +1265,7 @@ async def factors(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = int(fixture.get("timestamp") or 0)
         t_str = (datetime.utcfromtimestamp(ts) + timedelta(hours=3)).strftime("%H:%M МСК") if ts else "?"
 
-        lh, la, factors_line, dbg = compute_lambdas_and_factors(f)
+        lh, la, factors_line, _ = compute_lambdas_and_factors(f)
         if lh is None or la is None:
             factors_line = "Factors: (fallback/no λ stats)"
         msg.append(
@@ -1379,7 +1347,7 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("".join(msg))
 
 # ---------------------------
-# /signals (факторы + value + запись в БД)
+# /signals (value + factors + Model λ)
 # ---------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -1468,14 +1436,15 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lam_home, lam_away, factors_line, _dbg = compute_lambdas_and_factors(f)
 
         # probabilities
+        used_poisson = False
         if lam_home is not None and lam_away is not None:
+            used_poisson = True
             lam_total = lam_home + lam_away
             p_o25 = prob_over_line_poisson(lam_total, 2.5)
             p_u25 = clamp(1.0 - p_o25, 0.05, 0.95)
             p_btts_y = prob_btts_from_lambdas(lam_home, lam_away)
             p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.95)
         else:
-            # fallback
             w_k, _ = weather_factor(((fixture.get("venue") or {}).get("city")))
             hs = analyze_goals(get_last_matches(int(home_id), last=LAST_MATCHES_TOTAL))
             as_ = analyze_goals(get_last_matches(int(away_id), last=LAST_MATCHES_TOTAL))
@@ -1486,9 +1455,11 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             p_btts_y = prob_btts_fallback(hs, as_, w_k)
             p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
             factors_line = "Factors: (fallback — no λ stats)"
+            lam_home, lam_away = None, None
 
         lines_out: List[str] = []
 
+        # main markets
         for market_code, label, p, book, line, side in [
             ("O25", "ТБ 2.5", p_o25, odds.get("O25"), 2.5, "O"),
             ("U25", "ТМ 2.5", p_u25, odds.get("U25"), 2.5, "U"),
@@ -1500,8 +1471,8 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if s:
                 lines_out.append(s)
 
-        # IT (only if lambdas exist)
-        if lam_home is not None and lam_away is not None:
+        # individual totals only when lambdas exist
+        if used_poisson and lam_home is not None and lam_away is not None:
             it_specs = [
                 (0.5, "IT1_O05", "ИТ1 >0.5", "O", lam_home),
                 (1.5, "IT1_O15", "ИТ1 >1.5", "O", lam_home),
@@ -1530,11 +1501,18 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         found_any += 1
+
+        if lam_home is not None and lam_away is not None:
+            model_line = f"Model λ: Home={lam_home:.2f} | Away={lam_away:.2f} | Total={(lam_home+lam_away):.2f}"
+        else:
+            model_line = "Model λ: — (fallback mode)"
+
         out.append(
             f"🏆 {league_name}\n"
             f"{home_name} — {away_name}\n"
             f"🕒 {t_str}\n"
-            f"{factors_line}\n" +
+            f"{factors_line}\n"
+            f"{model_line}\n" +
             "\n".join(lines_out) +
             "\n\n"
         )
