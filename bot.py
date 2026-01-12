@@ -36,6 +36,10 @@ STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit fixed
 
 LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))
 
+# Fatigue (A)
+FATIGUE_WINDOW_DAYS = int(os.getenv("FATIGUE_WINDOW_DAYS", "7"))
+FATIGUE_LAST_N = int(os.getenv("FATIGUE_LAST_N", "10"))
+
 # Anti-anomalies
 ANOMALY_VALUE_WARN = float(os.getenv("ANOMALY_VALUE_WARN", "0.50"))
 
@@ -324,7 +328,7 @@ def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
     return True, ""
 
 # =====================================================
-# Weather (optional) + debug
+# Weather (optional)
 # =====================================================
 def weather_factor(city: Optional[str]) -> Tuple[float, str]:
     if not WEATHER_KEY or not city:
@@ -353,8 +357,8 @@ def weather_factor(city: Optional[str]) -> Tuple[float, str]:
         if wind > 8:
             factor *= 0.96
             notes.append("wind")
-        pct = int(round((factor - 1.0) * 100))
-        return factor, f"weather={pct}% ({'/'.join(notes) if notes else 'ok'})"
+        pct = (factor - 1.0) * 100.0
+        return factor, f"weather={pct:+.1f}% ({'/'.join(notes) if notes else 'ok'})"
     except:
         return 1.0, "weather=0%"
 
@@ -389,14 +393,14 @@ def weather_factor_debug(city: Optional[str]) -> Dict[str, Any]:
         if wind > 8:
             factor *= 0.96
             notes.append("wind")
-        pct = int(round((factor - 1.0) * 100))
+        pct = (factor - 1.0) * 100.0
         out.update({
             "ok": True,
             "temp": temp,
             "wind": wind,
             "rain_1h": rain,
             "factor": factor,
-            "reason": f"weather={pct}% ({'/'.join(notes) if notes else 'ok'})"
+            "reason": f"weather={pct:+.1f}% ({'/'.join(notes) if notes else 'ok'})"
         })
         return out
     except Exception as e:
@@ -414,7 +418,7 @@ def football_get(path: str, params: Dict[str, Any], timeout: int = 25) -> Any:
 
 def get_last_matches(team_id: int, last: int = 5) -> list:
     try:
-        j = football_get("/fixtures", {"team": team_id, "last": last, "season": SEASON})
+        j = football_get("/fixtures", {"team": team_id, "last": last}, timeout=25)
         return j.get("response", [])
     except:
         return []
@@ -464,7 +468,7 @@ def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[D
     return {"scored": scored / n, "conceded": conceded / n, "n": n, "opp_ids": opponents}
 
 # =====================================================
-# Factors: injuries / fatigue / motivation / SOS + debug
+# Factors: injuries / fatigue(A) / motivation / SOS(B)
 # =====================================================
 def get_injuries_raw(fixture_id: int) -> List[Dict[str, Any]]:
     try:
@@ -523,24 +527,36 @@ def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[in
     why_a = f"injA(att-{2*a_att}%,oppDef+{2*h_def}%)"
     return lam_home2, lam_away2, why_h, why_a
 
+# -------- A) Fatigue stable: last=N + filter by timestamp ----------
 def get_fatigue_factor(team_id: int, match_ts_utc: int) -> Tuple[float, str, int]:
+    """
+    Берём last=N матчей и вручную считаем FT/AET/PEN в окне FATIGUE_WINDOW_DAYS до матча.
+    """
     try:
         dt_match = datetime.utcfromtimestamp(int(match_ts_utc))
-        dt_from = (dt_match - timedelta(days=7)).date().isoformat()
-        dt_to = dt_match.date().isoformat()
-        j = football_get("/fixtures", {"team": team_id, "from": dt_from, "to": dt_to}, timeout=25)
-        resp = j.get("response", []) or []
+        window_start = dt_match - timedelta(days=FATIGUE_WINDOW_DAYS)
+        resp = get_last_matches(team_id, last=FATIGUE_LAST_N)
+
         played = 0
         for it in resp:
             fx = it.get("fixture", {}) or {}
+            ts = fx.get("timestamp")
+            if not ts:
+                continue
+            dt = datetime.utcfromtimestamp(int(ts))
+            if not (window_start <= dt < dt_match):
+                continue
             st = (fx.get("status", {}) or {}).get("short", "")
             if st in {"FT", "AET", "PEN"}:
                 played += 1
+
         if played >= 3:
-            return 0.95, "fatigue=-5%", played
-        if played == 2:
-            return 0.97, "fatigue=-3%", played
-        return 1.00, "fatigue=0%", played
+            k, why = 0.95, "fatigue=-5%"
+        elif played == 2:
+            k, why = 0.97, "fatigue=-3%"
+        else:
+            k, why = 1.00, "fatigue=0%"
+        return k, why, played
     except:
         return 1.00, "fatigue=0%", 0
 
@@ -548,24 +564,34 @@ def get_fatigue_debug(team_id: int, match_ts_utc: int) -> Dict[str, Any]:
     out = {"team_id": team_id, "ok": False}
     try:
         dt_match = datetime.utcfromtimestamp(int(match_ts_utc))
-        dt_from = (dt_match - timedelta(days=7)).date().isoformat()
-        dt_to = dt_match.date().isoformat()
-        j = football_get("/fixtures", {"team": team_id, "from": dt_from, "to": dt_to}, timeout=25)
-        resp = j.get("response", []) or []
+        window_start = dt_match - timedelta(days=FATIGUE_WINDOW_DAYS)
+        resp = get_last_matches(team_id, last=FATIGUE_LAST_N)
+
         played = 0
+        considered = 0
         statuses: Dict[str, int] = {}
         for it in resp:
             fx = it.get("fixture", {}) or {}
             st = (fx.get("status", {}) or {}).get("short", "") or "?"
             statuses[st] = statuses.get(st, 0) + 1
+
+            ts = fx.get("timestamp")
+            if not ts:
+                continue
+            dt = datetime.utcfromtimestamp(int(ts))
+            if not (window_start <= dt < dt_match):
+                continue
+            considered += 1
             if st in {"FT", "AET", "PEN"}:
                 played += 1
-        k, why, _played = get_fatigue_factor(team_id, match_ts_utc)
+
+        k, why, _ = get_fatigue_factor(team_id, match_ts_utc)
         out.update({
             "ok": True,
-            "from": dt_from,
-            "to": dt_to,
-            "resp_count": len(resp),
+            "window_days": FATIGUE_WINDOW_DAYS,
+            "last_n": FATIGUE_LAST_N,
+            "pulled": len(resp),
+            "considered_in_window": considered,
             "played_finished": played,
             "factor": k,
             "why": why,
@@ -628,12 +654,19 @@ def standings_debug(league_id: Optional[int]) -> Dict[str, Any]:
         out["error"] = str(e)
         return out
 
+# -------- B) SOS formatting shows small values ----------
+def sos_fmt(k: float) -> str:
+    pct = (k - 1.0) * 100.0
+    if abs(pct) < 0.05:
+        return "sos=0%"
+    return f"sos={pct:+.1f}%"
+
 def strength_of_schedule_factor(league_id: Optional[int], opp_ids: List[int]) -> Tuple[float, str]:
     if not league_id or not opp_ids:
-        return 1.0, "sos=0%"
+        return 1.0, sos_fmt(1.0)
     smap = get_standings_map(int(league_id))
     if not smap:
-        return 1.0, "sos=0%"
+        return 1.0, sos_fmt(1.0)
 
     pts = []
     for oid in opp_ids:
@@ -641,22 +674,21 @@ def strength_of_schedule_factor(league_id: Optional[int], opp_ids: List[int]) ->
         if row and row.get("points") is not None:
             pts.append(int(row["points"]))
     if len(pts) < 3:
-        return 1.0, "sos=0%"
+        return 1.0, sos_fmt(1.0)
 
     league_pts = [int(v.get("points") or 0) for v in smap.values() if v.get("points") is not None]
     if not league_pts:
-        return 1.0, "sos=0%"
+        return 1.0, sos_fmt(1.0)
 
     avg_opp = sum(pts) / len(pts)
     avg_lg = sum(league_pts) / len(league_pts)
     if avg_lg <= 0:
-        return 1.0, "sos=0%"
+        return 1.0, sos_fmt(1.0)
 
     diff = (avg_opp - avg_lg) / avg_lg
     diff = max(-0.15, min(0.15, diff))
     k = 1.0 + 0.04 * diff
-    pct = int(round((k - 1.0) * 100))
-    return k, f"sos={pct:+d}%"
+    return k, sos_fmt(k)
 
 def sos_debug(league_id: Optional[int], opp_ids: List[int]) -> Dict[str, Any]:
     out = {"league_id": league_id, "ok": False, "opp_ids": len(opp_ids or [])}
@@ -1175,22 +1207,18 @@ def is_finished_status(short: str) -> bool:
 
 def settle_result_for_market(market_code: str, hg: int, ag: int) -> str:
     total = hg + ag
-
     if market_code == "O15":
         return "WIN" if total >= 2 else "LOSE"
     if market_code == "U15":
         return "WIN" if total <= 1 else "LOSE"
-
     if market_code == "O25":
         return "WIN" if total >= 3 else "LOSE"
     if market_code == "U25":
         return "WIN" if total <= 2 else "LOSE"
-
     if market_code == "O35":
         return "WIN" if total >= 4 else "LOSE"
     if market_code == "U35":
         return "WIN" if total <= 3 else "LOSE"
-
     return "PUSH"
 
 def profit_for_result(result: str, odds: float, stake: float) -> float:
@@ -1270,7 +1298,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Рынок: общий тотал голов (1.5 / 2.5 / 3.5)\n\n"
         "Команды:\n"
         "• /signals — value-сигналы (P≥75% и Value>0)\n"
-        "• /lines — линии без фильтра\n"
+        "• /lines — лучшие odds по тоталам без фильтра\n"
         "• /settle — рассчитать результаты PENDING\n"
         "• /roi — ROI/проходимость\n"
         "• /history — последние 20 сигналов\n"
@@ -1279,7 +1307,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /factors_debug [n] — debug факторов по n-му матчу дня\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
-        f"Анти-анома Value: >{ANOMALY_VALUE_WARN:+.2f} → ⚠️\n"
+        f"Анти-аномалия: Value>{ANOMALY_VALUE_WARN:+.2f} → ⚠️ проверь линию вручную\n"
+        f"Fatigue окно: {FATIGUE_WINDOW_DAYS} дней (last={FATIGUE_LAST_N})\n"
         f"Stake: {STAKE:.2f} unit\n"
     )
 
@@ -1351,29 +1380,23 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     venue = fixture.get("venue") or {}
     city = venue.get("city")
 
-    # venue stats
     hs = team_goal_stats_venue(home_id, "home", last=LAST_MATCHES_TEAM)
     as_ = team_goal_stats_venue(away_id, "away", last=LAST_MATCHES_TEAM)
 
-    # injuries raw
     inj_raw = get_injuries_raw(fixture_id)
     inj_map = get_injuries_by_fixture(fixture_id)
     h_inj = inj_map.get(home_id, {"att": 0, "def": 0})
     a_inj = inj_map.get(away_id, {"att": 0, "def": 0})
 
-    # fatigue debug
     fat_h = get_fatigue_debug(home_id, ts)
     fat_a = get_fatigue_debug(away_id, ts)
 
-    # standings + sos debug
     st_dbg = standings_debug(league_id)
     sos_h_dbg = sos_debug(league_id, (hs or {}).get("opp_ids") or [])
     sos_a_dbg = sos_debug(league_id, (as_ or {}).get("opp_ids") or [])
 
-    # weather debug
     w_dbg = weather_factor_debug(city)
 
-    # final factors line
     lam_home, lam_away, factors_line = compute_lambdas_and_factors(f)
 
     lines = []
@@ -1383,45 +1406,34 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"🕒 {dt_msk.strftime('%Y-%m-%d %H:%M')} МСК | fixture_id={fixture_id}")
     lines.append("")
 
-    # venue stats
     if hs and as_:
-        lines.append("1) Venue stats (последние матчи по месту):")
-        lines.append(f"Home venue stats: n={int(hs['n'])} scored={hs['scored']:.2f} conceded={hs['conceded']:.2f} opp_ids={len(hs.get('opp_ids') or [])}")
-        lines.append(f"Away venue stats: n={int(as_['n'])} scored={as_['scored']:.2f} conceded={as_['conceded']:.2f} opp_ids={len(as_.get('opp_ids') or [])}")
+        lines.append("1) Venue stats:")
+        lines.append(f"Home: n={int(hs['n'])} scored={hs['scored']:.2f} conceded={hs['conceded']:.2f} opp_ids={len(hs.get('opp_ids') or [])}")
+        lines.append(f"Away: n={int(as_['n'])} scored={as_['scored']:.2f} conceded={as_['conceded']:.2f} opp_ids={len(as_.get('opp_ids') or [])}")
     else:
-        lines.append("1) Venue stats: ❌ не смог собрать (нет матчей/данных)")
+        lines.append("1) Venue stats: ❌ (no data)")
 
     lines.append("")
-    # injuries
     lines.append("2) Injuries:")
     lines.append(f"API /injuries response count: {len(inj_raw)}")
     lines.append(f"Parsed injuries home(att/def): {h_inj.get('att',0)}/{h_inj.get('def',0)} | away(att/def): {a_inj.get('att',0)}/{a_inj.get('def',0)}")
-    if inj_raw:
-        lines.append("Sample (до 5 строк):")
-        for it in inj_raw[:5]:
-            tname = ((it.get("team") or {}).get("name") or "?")
-            pname = ((it.get("player") or {}).get("name") or "?")
-            ptype = ((it.get("player") or {}).get("type") or "?")
-            reason = ((it.get("player") or {}).get("reason") or "")
-            lines.append(f"- {tname}: {pname} | type={ptype} | {reason}")
-    else:
-        lines.append("NOTE: если тут 0 — значит API реально не отдаёт injuries по этому матчу (поэтому inj=0%).")
+    if not inj_raw:
+        lines.append("NOTE: injuries=0 → API реально не отдаёт травмы по этому fixture.")
 
     lines.append("")
-    # fatigue
-    lines.append("3) Fatigue (окно 7 дней):")
+    lines.append("3) Fatigue (A):")
     for tag, d in [("Home", fat_h), ("Away", fat_a)]:
         if not d.get("ok"):
-            lines.append(f"{tag}: ❌ ошибка/нет данных: {d.get('error','?')}")
+            lines.append(f"{tag}: ❌ {d.get('error','?')}")
             continue
-        lines.append(f"{tag}: from={d.get('from')} to={d.get('to')} resp={d.get('resp_count')} finished={d.get('played_finished')} factor={d.get('factor'):.3f} {d.get('why')}")
-        st = d.get("statuses") or {}
-        top = sorted(st.items(), key=lambda x: -x[1])[:6]
-        lines.append(f"{tag}: statuses sample: " + ", ".join([f"{k}:{v}" for k,v in top]))
+        lines.append(
+            f"{tag}: window={d.get('window_days')}d last={d.get('last_n')} pulled={d.get('pulled')} "
+            f"considered={d.get('considered_in_window')} finished={d.get('played_finished')} "
+            f"factor={d.get('factor'):.3f} {d.get('why')}"
+        )
 
     lines.append("")
-    # standings/sos
-    lines.append("4) Standings / SOS:")
+    lines.append("4) Standings / SOS (B):")
     if st_dbg.get("ok"):
         lines.append(f"Standings teams: {st_dbg.get('teams')} | points min/max: {st_dbg.get('points_min')}/{st_dbg.get('points_max')}")
     else:
@@ -1429,12 +1441,11 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for tag, d in [("SOS home", sos_h_dbg), ("SOS away", sos_a_dbg)]:
         if d.get("ok"):
-            lines.append(f"{tag}: opp_ids={d.get('opp_ids')} opp_pts={d.get('opp_pts_count')} avg_opp={d.get('avg_opp'):.2f} avg_lg={d.get('avg_league'):.2f} factor={d.get('factor'):.4f} {d.get('why')}")
+            lines.append(f"{tag}: opp_ids={d.get('opp_ids')} opp_pts={d.get('opp_pts_count')} factor={d.get('factor'):.4f} {d.get('why')}")
         else:
-            lines.append(f"{tag}: ❌ {d.get('note') or d.get('error') or 'no data'} (opp_ids={d.get('opp_ids')}, standings_teams={d.get('standings_teams')})")
+            lines.append(f"{tag}: ❌ {d.get('note') or d.get('error') or 'no data'}")
 
     lines.append("")
-    # weather
     lines.append("5) Weather:")
     lines.append(f"Venue city: {city}")
     if w_dbg.get("ok"):
@@ -1443,8 +1454,7 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"weather debug: {w_dbg.get('reason')} | note={w_dbg.get('note') or w_dbg.get('error')}")
 
     lines.append("")
-    # final
-    lines.append("6) Итоговая строка Factors и лямбды:")
+    lines.append("6) Итог:")
     lines.append(factors_line)
     if lam_home is not None and lam_away is not None:
         lines.append(f"Model λ: Home={lam_home:.2f} Away={lam_away:.2f} Total={lam_home+lam_away:.2f}")
@@ -1559,7 +1569,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{market_label}: P={int(p*100)}% | Book={float(book):.2f} | Fair={fair:.2f} | Value={v:+.2f}{warns}"
 
-        # Сохраняем только если odds нормальные
+        # сохраняем только если odds sane
         if ok_odds:
             db_upsert_signal({
                 "created_at": datetime.utcnow().isoformat(),
@@ -1637,8 +1647,12 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines_out: List[str] = []
         for code, label, line, side, p, book in markets:
-            s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
-                                code, label, line, side, p, book)
+            s = try_emit_signal(
+                int(fixture_id),
+                datetime.utcfromtimestamp(ts).isoformat(),
+                league_name, home_name, away_name,
+                code, label, line, side, p, book
+            )
             if s:
                 lines_out.append(s)
 
