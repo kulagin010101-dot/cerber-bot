@@ -34,20 +34,13 @@ MIN_PROB = float(os.getenv("MIN_PROB", "0.75"))     # 75%
 MIN_VALUE = float(os.getenv("MIN_VALUE", "0.00"))   # value > 0
 STAKE = float(os.getenv("STAKE", "1.0"))            # 1 unit fixed
 
-LAST_MATCHES_TOTAL = int(os.getenv("LAST_MATCHES_TOTAL", "6"))  # fallback
-LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))    # team stats
+LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))
 
-# -------------------------
 # Anti-anomalies
-# -------------------------
 ANOMALY_VALUE_WARN = float(os.getenv("ANOMALY_VALUE_WARN", "0.50"))
 
 SANITY_OU_MIN = float(os.getenv("SANITY_OU_MIN", "1.05"))
 SANITY_OU_MAX = float(os.getenv("SANITY_OU_MAX", "6.00"))
-SANITY_BTTS_MIN = float(os.getenv("SANITY_BTTS_MIN", "1.05"))
-SANITY_BTTS_MAX = float(os.getenv("SANITY_BTTS_MAX", "6.00"))
-SANITY_IT_MIN = float(os.getenv("SANITY_IT_MIN", "1.05"))
-SANITY_IT_MAX = float(os.getenv("SANITY_IT_MAX", "10.00"))
 
 STATE_FILE = "state.json"
 DB_FILE = "cerber.db"
@@ -139,7 +132,7 @@ def save_state(state: Dict[str, Any]) -> None:
 STATE = load_state()
 
 # =====================================================
-# DB
+# DB (SQLite)
 # =====================================================
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_FILE)
@@ -324,16 +317,8 @@ def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
         return False, "⚠️ подозрительная линия (odds)"
     book = float(book)
 
-    if market_code in {"O25", "U25"}:
+    if market_code in {"O15", "U15", "O25", "U25", "O35", "U35"}:
         ok = (SANITY_OU_MIN <= book <= SANITY_OU_MAX)
-        return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
-
-    if market_code in {"BTTS_Y", "BTTS_N"}:
-        ok = (SANITY_BTTS_MIN <= book <= SANITY_BTTS_MAX)
-        return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
-
-    if market_code.startswith("IT1_") or market_code.startswith("IT2_"):
-        ok = (SANITY_IT_MIN <= book <= SANITY_IT_MAX)
         return ok, ("⚠️ подозрительная линия (odds)" if not ok else "")
 
     return True, ""
@@ -389,29 +374,8 @@ def get_last_matches(team_id: int, last: int = 5) -> list:
     except:
         return []
 
-def analyze_goals(matches: list) -> Optional[Dict[str, float]]:
-    total_goals = 0.0
-    btts_yes = 0.0
-    over25 = 0.0
-    n = 0.0
-    for m in matches:
-        goals = m.get("goals", {}) or {}
-        h, a = goals.get("home"), goals.get("away")
-        if h is None or a is None:
-            continue
-        h = float(h); a = float(a)
-        n += 1.0
-        total_goals += (h + a)
-        if h > 0 and a > 0:
-            btts_yes += 1.0
-        if (h + a) > 2.0:
-            over25 += 1.0
-    if n == 0:
-        return None
-    return {"avg": total_goals / n, "btts": btts_yes / n, "over25": over25 / n}
-
 def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[Dict[str, float]]:
-    matches = get_last_matches(team_id, last=last + 8)  # запас
+    matches = get_last_matches(team_id, last=last + 8)
     scored = 0.0
     conceded = 0.0
     n = 0.0
@@ -429,7 +393,6 @@ def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[D
         if not home or not away:
             continue
 
-        # фильтр venue
         if venue == "home" and int(home) != int(team_id):
             continue
         if venue == "away" and int(away) != int(team_id):
@@ -658,33 +621,6 @@ def prob_over_line_poisson(lam: float, line: float) -> float:
     p = 1.0 - poisson_cdf(k, lam)
     return clamp(p, 0.05, 0.95)
 
-def prob_under_line_poisson(lam: float, line: float) -> float:
-    k = int(math.floor(line))
-    p = poisson_cdf(k, lam)
-    return clamp(p, 0.05, 0.95)
-
-def prob_btts_from_lambdas(lh: float, la: float) -> float:
-    p = 1.0 - math.exp(-lh) - math.exp(-la) + math.exp(-(lh + la))
-    return clamp(p, 0.05, 0.95)
-
-def prob_over25_fallback(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
-    p = 0.60
-    base = (hs["avg"] + as_["avg"]) / 2.0
-    if base >= 2.6: p += 0.08
-    if hs["over25"] >= 0.6: p += 0.05
-    if as_["over25"] >= 0.6: p += 0.05
-    if hs["btts"] >= 0.6 and as_["btts"] >= 0.6: p += 0.04
-    p *= w_k
-    return clamp(p, 0.05, 0.90)
-
-def prob_btts_fallback(hs: Dict[str, float], as_: Dict[str, float], w_k: float) -> float:
-    p = 0.50
-    p += 0.25 * (hs["btts"] - 0.5)
-    p += 0.25 * (as_["btts"] - 0.5)
-    p += 0.05 * (((hs["avg"] + as_["avg"]) / 2.0) - 2.4)
-    p *= w_k
-    return clamp(p, 0.05, 0.90)
-
 # =====================================================
 # API-Football: league ids + fixtures today filtered
 # =====================================================
@@ -901,23 +837,15 @@ def get_markets_meta(force: bool = False) -> Dict[int, Dict[str, Any]]:
     return meta
 
 # =====================================================
-# Odds parsing (OU2.5 + BTTS + IT lines)
+# Odds parsing: ONLY Full Time OU 1.5 / 2.5 / 3.5
 # =====================================================
-BTTS_MARKET_ID = 104
 OU_FT_NAME = "over under full time"
-TEAM1_OU_NAME = "over under team 1"
-TEAM2_OU_NAME = "over under team 2"
 
 def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) -> Dict[str, Optional[float]]:
     out: Dict[str, Optional[float]] = {
+        "O15": None, "U15": None,
         "O25": None, "U25": None,
-        "BTTS_Y": None, "BTTS_N": None,
-        "IT1_O05": None, "IT1_U05": None,
-        "IT1_O15": None, "IT1_U15": None,
-        "IT1_O25": None, "IT1_U25": None,
-        "IT2_O05": None, "IT2_U05": None,
-        "IT2_O15": None, "IT2_U15": None,
-        "IT2_O25": None, "IT2_U25": None,
+        "O35": None, "U35": None,
     }
 
     bm = ((item.get("bookmakerOdds") or {}).get(ODDSPAPI_BOOKMAKER) or {})
@@ -930,12 +858,17 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         except:
             return None
 
-    def set_ou(over_key: str, under_key: str, oname: str, price: float):
-        n = oname.lower()
-        if "over" in n:
-            out[over_key] = price
-        elif "under" in n:
-            out[under_key] = price
+    def set_ou(line: float, oname: str, price: float):
+        n = (oname or "").lower()
+        if line == 1.5:
+            if "over" in n: out["O15"] = price
+            if "under" in n: out["U15"] = price
+        if line == 2.5:
+            if "over" in n: out["O25"] = price
+            if "under" in n: out["U25"] = price
+        if line == 3.5:
+            if "over" in n: out["O35"] = price
+            if "under" in n: out["U35"] = price
 
     for mid_str, m in markets.items():
         try:
@@ -949,71 +882,26 @@ def parse_odds(item: Dict[str, Any], markets_meta: Dict[int, Dict[str, Any]]) ->
         outcomes_meta: Dict[int, str] = meta.get("outcomes") or {}
         outcomes = m.get("outcomes") or {}
 
-        # BTTS
-        if mid == BTTS_MARKET_ID:
-            for oid_str, o in outcomes.items():
-                try:
-                    oid = int(oid_str)
-                except:
-                    continue
-                price = price_from_players(o.get("players") or {})
-                if price is None:
-                    continue
-                on = (outcomes_meta.get(oid, "") or "").lower()
-                if "yes" in on:
-                    out["BTTS_Y"] = price
-                if "no" in on:
-                    out["BTTS_N"] = price
+        if OU_FT_NAME not in mname:
+            continue
 
-        # handicap float
-        h = None
         try:
-            if hcap is not None:
-                h = float(hcap)
+            line = float(hcap)
         except:
-            h = None
+            continue
+        if line not in (1.5, 2.5, 3.5):
+            continue
 
-        # Full Time OU 2.5
-        if (OU_FT_NAME in mname) and (h == 2.5):
-            for oid_str, o in outcomes.items():
-                try:
-                    oid = int(oid_str)
-                except:
-                    continue
-                price = price_from_players(o.get("players") or {})
-                if price is None:
-                    continue
-                oname = outcomes_meta.get(oid, "") or ""
-                set_ou("O25", "U25", oname, price)
-
-        # Team totals (0.5/1.5/2.5)
-        if (TEAM1_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
-            for oid_str, o in outcomes.items():
-                try:
-                    oid = int(oid_str)
-                except:
-                    continue
-                price = price_from_players(o.get("players") or {})
-                if price is None:
-                    continue
-                oname = outcomes_meta.get(oid, "") or ""
-                if h == 0.5: set_ou("IT1_O05", "IT1_U05", oname, price)
-                if h == 1.5: set_ou("IT1_O15", "IT1_U15", oname, price)
-                if h == 2.5: set_ou("IT1_O25", "IT1_U25", oname, price)
-
-        if (TEAM2_OU_NAME in mname) and (h in (0.5, 1.5, 2.5)):
-            for oid_str, o in outcomes.items():
-                try:
-                    oid = int(oid_str)
-                except:
-                    continue
-                price = price_from_players(o.get("players") or {})
-                if price is None:
-                    continue
-                oname = outcomes_meta.get(oid, "") or ""
-                if h == 0.5: set_ou("IT2_O05", "IT2_U05", oname, price)
-                if h == 1.5: set_ou("IT2_O15", "IT2_U15", oname, price)
-                if h == 2.5: set_ou("IT2_O25", "IT2_U25", oname, price)
+        for oid_str, o in outcomes.items():
+            try:
+                oid = int(oid_str)
+            except:
+                continue
+            price = price_from_players(o.get("players") or {})
+            if price is None:
+                continue
+            oname = outcomes_meta.get(oid, "") or ""
+            set_ou(line, oname, price)
 
     return out
 
@@ -1153,31 +1041,20 @@ def is_finished_status(short: str) -> bool:
 def settle_result_for_market(market_code: str, hg: int, ag: int) -> str:
     total = hg + ag
 
+    if market_code == "O15":
+        return "WIN" if total >= 2 else "LOSE"
+    if market_code == "U15":
+        return "WIN" if total <= 1 else "LOSE"
+
     if market_code == "O25":
         return "WIN" if total >= 3 else "LOSE"
     if market_code == "U25":
         return "WIN" if total <= 2 else "LOSE"
 
-    if market_code == "BTTS_Y":
-        return "WIN" if (hg > 0 and ag > 0) else "LOSE"
-    if market_code == "BTTS_N":
-        return "WIN" if (hg == 0 or ag == 0) else "LOSE"
-
-    def parse_it(code: str) -> Tuple[str, float, str]:
-        team = "1" if code.startswith("IT1_") else "2"
-        side = "O" if "_O" in code else "U"
-        tail = code.split("_")[-1]  # O15 / U25
-        num = tail[1:]
-        line = float(num[0] + "." + num[1])  # 1.5
-        return team, line, side
-
-    if market_code.startswith("IT1_") or market_code.startswith("IT2_"):
-        team, line, side = parse_it(market_code)
-        tg = hg if team == "1" else ag
-        if side == "O":
-            return "WIN" if tg > line else "LOSE"
-        else:
-            return "WIN" if tg < line else "LOSE"
+    if market_code == "O35":
+        return "WIN" if total >= 4 else "LOSE"
+    if market_code == "U35":
+        return "WIN" if total <= 3 else "LOSE"
 
     return "PUSH"
 
@@ -1189,9 +1066,9 @@ def profit_for_result(result: str, odds: float, stake: float) -> float:
     return 0.0
 
 # =====================================================
-# Core factor computation per fixture
+# Core factor computation per fixture (lambda model)
 # =====================================================
-def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str, Dict[str, Any]]:
+def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
     fixture = f.get("fixture") or {}
     teams = f.get("teams") or {}
     home_t = teams.get("home") or {}
@@ -1206,41 +1083,35 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
     league_id = league_obj.get("id")
 
     if not fixture_id or not home_id or not away_id or not ts:
-        return None, None, "Factors: (no ids)", {}
+        return None, None, "Factors: (no ids)"
 
-    # home/away venue stats
     home_stats = team_goal_stats_venue(int(home_id), venue="home", last=LAST_MATCHES_TEAM)
     away_stats = team_goal_stats_venue(int(away_id), venue="away", last=LAST_MATCHES_TEAM)
     if not home_stats or not away_stats:
-        return None, None, "Factors: (fallback — no venue λ stats)", {}
+        return None, None, "Factors: (no venue stats)"
 
     lam_home = max(0.05, (home_stats["scored"] + away_stats["conceded"]) / 2.0)
     lam_away = max(0.05, (away_stats["scored"] + home_stats["conceded"]) / 2.0)
 
-    # SOS
     sos_h_k, sos_h_why = strength_of_schedule_factor(league_id, home_stats.get("opp_ids") or [])
     sos_a_k, sos_a_why = strength_of_schedule_factor(league_id, away_stats.get("opp_ids") or [])
     lam_home *= sos_h_k
     lam_away *= sos_a_k
 
-    # weather
     venue = fixture.get("venue") or {}
     city = venue.get("city")
     w_k, w_why = weather_factor(city)
     lam_home *= w_k
     lam_away *= w_k
 
-    # injuries
     injuries_map = get_injuries_by_fixture(int(fixture_id))
     lam_home, lam_away, inj_h, inj_a = apply_injury_adjustments(lam_home, lam_away, injuries_map, int(home_id), int(away_id))
 
-    # fatigue
     fat_h_k, fat_h_why, fat_h_n = get_fatigue_factor(int(home_id), ts)
     fat_a_k, fat_a_why, fat_a_n = get_fatigue_factor(int(away_id), ts)
     lam_home *= fat_h_k
     lam_away *= fat_a_k
 
-    # motivation
     mot_h_k, mot_a_k, mot_h_why, mot_a_why = get_motivation_factor(league_name, league_id, int(home_id), int(away_id))
     lam_home *= mot_h_k
     lam_away *= mot_a_k
@@ -1253,21 +1124,7 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
         f"{fat_h_why}({fat_h_n}), {fat_a_why}({fat_a_n}); "
         f"{mot_h_why}, {mot_a_why}; {sos_h_why}, {sos_a_why}; {w_why}"
     )
-
-    debug = {
-        "fixture_id": int(fixture_id),
-        "home_id": int(home_id),
-        "away_id": int(away_id),
-        "league_id": league_id,
-        "league_name": league_name,
-        "city": city,
-        "lam_home": lam_home,
-        "lam_away": lam_away,
-        "injuries": injuries_map,
-        "fatigue_home_n": fat_h_n,
-        "fatigue_away_n": fat_a_n,
-    }
-    return lam_home, lam_away, factors_line, debug
+    return lam_home, lam_away, factors_line
 
 # =====================================================
 # Telegram commands
@@ -1275,9 +1132,10 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🐺 ЦЕРБЕР активирован.\n\n"
+        "Рынок: общий тотал голов (1.5 / 2.5 / 3.5)\n\n"
         "Команды:\n"
-        "• /signals — value-сигналы (OU2.5, BTTS, ИТ) + факторы\n"
-        "• /lines — линии (без фильтра value)\n"
+        "• /signals — value-сигналы (P≥75% и Value>0)\n"
+        "• /lines — линии без фильтра\n"
         "• /settle — рассчитать результаты PENDING\n"
         "• /roi — ROI/проходимость\n"
         "• /history — последние 20 сигналов\n"
@@ -1314,7 +1172,7 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(part)
 
 # ---------------------------
-# /lines
+# /lines — totals only
 # ---------------------------
 async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -1329,7 +1187,7 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
         return
 
-    msg = [f"📌 ЛИНИИ ({used_date})\nBookmaker: {ODDSPAPI_BOOKMAKER}\n\n"]
+    msg = [f"📌 ЛИНИИ (тоталы) ({used_date})\nBookmaker: {ODDSPAPI_BOOKMAKER}\n\n"]
     sent = 0
     batch = 0
 
@@ -1358,26 +1216,25 @@ async def lines(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 {league.get('name','?')}\n"
             f"{home.get('name','?')} — {away.get('name','?')}\n"
             f"🕒 {t_str}\n"
+            f"ТБ 1.5: {fmt_odds(o['O15'])} | ТМ 1.5: {fmt_odds(o['U15'])}\n"
             f"ТБ 2.5: {fmt_odds(o['O25'])} | ТМ 2.5: {fmt_odds(o['U25'])}\n"
-            f"ОЗ Да: {fmt_odds(o['BTTS_Y'])} | ОЗ Нет: {fmt_odds(o['BTTS_N'])}\n"
-            f"ИТ1 >0.5: {fmt_odds(o['IT1_O05'])} | >1.5: {fmt_odds(o['IT1_O15'])} | >2.5: {fmt_odds(o['IT1_O25'])}\n"
-            f"ИТ2 >0.5: {fmt_odds(o['IT2_O05'])} | >1.5: {fmt_odds(o['IT2_O15'])} | >2.5: {fmt_odds(o['IT2_O25'])}\n\n"
+            f"ТБ 3.5: {fmt_odds(o['O35'])} | ТМ 3.5: {fmt_odds(o['U35'])}\n\n"
         )
 
         batch += 1
-        if batch % 4 == 0:
+        if batch % 5 == 0:
             await update.message.reply_text("".join(msg))
             msg = ["(продолжение)\n\n"]
 
     if sent == 0:
-        await update.message.reply_text(f"📭 На дату {used_date} не нашёл линий у {ODDSPAPI_BOOKMAKER}.")
+        await update.message.reply_text(f"📭 На дату {used_date} не нашёл линий тоталов у {ODDSPAPI_BOOKMAKER}.")
         return
 
     if msg:
         await update.message.reply_text("".join(msg))
 
 # ---------------------------
-# /signals
+# /signals — totals only
 # ---------------------------
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fixtures, _, _, used_date = get_today_matches_filtered()
@@ -1392,12 +1249,12 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ OddsPapi ошибка: {e}")
         return
 
-    out = [f"⚽ ЦЕРБЕР — value-сигналы ({used_date})\nOdds: {ODDSPAPI_BOOKMAKER}\n\n"]
+    out = [f"⚽ ЦЕРБЕР — value-сигналы (тоталы) ({used_date})\nOdds: {ODDSPAPI_BOOKMAKER}\n\n"]
     found_any = 0
     batch = 0
 
     def try_emit_signal(fixture_id: int, match_date: str, league: str, home: str, away: str,
-                        market_code: str, market_label: str, line: Optional[float], side: Optional[str],
+                        market_code: str, market_label: str, line: float, side: str,
                         p: float, book: Optional[float]) -> Optional[str]:
         if book is None:
             return None
@@ -1419,7 +1276,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{market_label}: P={int(p*100)}% | Book={float(book):.2f} | Fair={fair:.2f} | Value={v:+.2f}{warns}"
 
-        # сохраняем в БД только если odds выглядят нормальными
+        # Сохраняем только если odds нормальные
         if ok_odds:
             db_upsert_signal({
                 "created_at": datetime.utcnow().isoformat(),
@@ -1430,7 +1287,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "away": away,
                 "market_code": market_code,
                 "market_label": market_label,
-                "line": line,
+                "line": float(line),
                 "side": side,
                 "p_model": p,
                 "book_odds": float(book),
@@ -1452,11 +1309,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not fixture_id:
             continue
 
-        home_id = home_t.get("id")
-        away_id = away_t.get("id")
-        if not home_id or not away_id:
-            continue
-
         ts = int(fixture.get("timestamp") or 0)
         if not ts:
             continue
@@ -1473,99 +1325,65 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
 
         odds = parse_odds(it, markets_meta)
+        if not any(v is not None for v in odds.values()):
+            continue
 
-        lam_home, lam_away, factors_line, _dbg = compute_lambdas_and_factors(f)
+        lam_home, lam_away, factors_line = compute_lambdas_and_factors(f)
+        if lam_home is None or lam_away is None:
+            continue
 
-        used_poisson = False
-        if lam_home is not None and lam_away is not None:
-            used_poisson = True
-            lam_total = lam_home + lam_away
-            p_o25 = prob_over_line_poisson(lam_total, 2.5)
-            p_u25 = clamp(1.0 - p_o25, 0.05, 0.95)
-            p_btts_y = prob_btts_from_lambdas(lam_home, lam_away)
-            p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.95)
-        else:
-            w_k, _ = weather_factor(((fixture.get("venue") or {}).get("city")))
-            hs = analyze_goals(get_last_matches(int(home_id), last=LAST_MATCHES_TOTAL))
-            as_ = analyze_goals(get_last_matches(int(away_id), last=LAST_MATCHES_TOTAL))
-            if not hs or not as_:
-                continue
-            p_o25 = prob_over25_fallback(hs, as_, w_k)
-            p_u25 = clamp(1.0 - p_o25, 0.05, 0.90)
-            p_btts_y = prob_btts_fallback(hs, as_, w_k)
-            p_btts_n = clamp(1.0 - p_btts_y, 0.05, 0.90)
-            factors_line = "Factors: (fallback — no λ stats)"
-            lam_home, lam_away = None, None
+        lam_total = lam_home + lam_away
+
+        # Probabilities from Poisson
+        p_o15 = prob_over_line_poisson(lam_total, 1.5)
+        p_u15 = clamp(1.0 - p_o15, 0.05, 0.95)
+
+        p_o25 = prob_over_line_poisson(lam_total, 2.5)
+        p_u25 = clamp(1.0 - p_o25, 0.05, 0.95)
+
+        p_o35 = prob_over_line_poisson(lam_total, 3.5)
+        p_u35 = clamp(1.0 - p_o35, 0.05, 0.95)
+
+        markets = [
+            ("O15", "ТБ 1.5", 1.5, "O", p_o15, odds.get("O15")),
+            ("U15", "ТМ 1.5", 1.5, "U", p_u15, odds.get("U15")),
+            ("O25", "ТБ 2.5", 2.5, "O", p_o25, odds.get("O25")),
+            ("U25", "ТМ 2.5", 2.5, "U", p_u25, odds.get("U25")),
+            ("O35", "ТБ 3.5", 3.5, "O", p_o35, odds.get("O35")),
+            ("U35", "ТМ 3.5", 3.5, "U", p_u35, odds.get("U35")),
+        ]
 
         lines_out: List[str] = []
-
-        base_markets = [
-            ("O25", "ТБ 2.5", p_o25, odds.get("O25"), 2.5, "O"),
-            ("U25", "ТМ 2.5", p_u25, odds.get("U25"), 2.5, "U"),
-            ("BTTS_Y", "ОЗ Да", p_btts_y, odds.get("BTTS_Y"), None, "Y"),
-            ("BTTS_N", "ОЗ Нет", p_btts_n, odds.get("BTTS_N"), None, "N"),
-        ]
-        for market_code, label, p, book, line, side in base_markets:
+        for code, label, line, side, p, book in markets:
             s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
-                                market_code, label, line, side, p, book)
+                                code, label, line, side, p, book)
             if s:
                 lines_out.append(s)
-
-        if used_poisson and lam_home is not None and lam_away is not None:
-            it_specs = [
-                (0.5, "IT1_O05", "ИТ1 >0.5", "O", lam_home),
-                (1.5, "IT1_O15", "ИТ1 >1.5", "O", lam_home),
-                (2.5, "IT1_O25", "ИТ1 >2.5", "O", lam_home),
-                (0.5, "IT2_O05", "ИТ2 >0.5", "O", lam_away),
-                (1.5, "IT2_O15", "ИТ2 >1.5", "O", lam_away),
-                (2.5, "IT2_O25", "ИТ2 >2.5", "O", lam_away),
-                (0.5, "IT1_U05", "ИТ1 <0.5", "U", lam_home),
-                (1.5, "IT1_U15", "ИТ1 <1.5", "U", lam_home),
-                (2.5, "IT1_U25", "ИТ1 <2.5", "U", lam_home),
-                (0.5, "IT2_U05", "ИТ2 <0.5", "U", lam_away),
-                (1.5, "IT2_U15", "ИТ2 <1.5", "U", lam_away),
-                (2.5, "IT2_U25", "ИТ2 <2.5", "U", lam_away),
-            ]
-            for line, code, label, side, lam in it_specs:
-                book = odds.get(code)
-                if book is None:
-                    continue
-                p = prob_over_line_poisson(lam, line) if side == "O" else prob_under_line_poisson(lam, line)
-                s = try_emit_signal(int(fixture_id), datetime.utcfromtimestamp(ts).isoformat(), league_name, home_name, away_name,
-                                    code, label, float(line), side, p, book)
-                if s:
-                    lines_out.append(s)
 
         if not lines_out:
             continue
 
         found_any += 1
-        model_line = (
-            f"Model λ: Home={lam_home:.2f} | Away={lam_away:.2f} | Total={(lam_home+lam_away):.2f}"
-            if (lam_home is not None and lam_away is not None)
-            else "Model λ: — (fallback mode)"
-        )
-
         out.append(
             f"🏆 {league_name}\n"
             f"{home_name} — {away_name}\n"
             f"🕒 {t_str}\n"
             f"{factors_line}\n"
-            f"{model_line}\n" +
-            "\n".join(lines_out) +
-            "\n\n"
+            f"Model λ: Home={lam_home:.2f} | Away={lam_away:.2f} | Total={lam_total:.2f}\n"
+            + "\n".join(lines_out)
+            + "\n\n"
         )
 
         batch += 1
-        if batch % 6 == 0:
+        if batch % 5 == 0:
             await update.message.reply_text("".join(out))
             out = ["(продолжение)\n\n"]
 
     if found_any == 0:
         await update.message.reply_text(
-            f"📭 На дату {used_date} нет value-сигналов при порогах:\n"
+            f"📭 На дату {used_date} нет value-сигналов по тоталам при порогах:\n"
             f"P ≥ {int(MIN_PROB*100)}% и Value > {MIN_VALUE:+.2f}\n\n"
-            "Подсказка: /lines покажет просто коэффициенты без фильтра."
+            "Подсказка: /lines покажет коэффициенты без фильтра."
         )
         return
 
