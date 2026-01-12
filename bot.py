@@ -324,7 +324,7 @@ def odds_sanity(market_code: str, book: float) -> Tuple[bool, str]:
     return True, ""
 
 # =====================================================
-# Weather (optional)
+# Weather (optional) + debug
 # =====================================================
 def weather_factor(city: Optional[str]) -> Tuple[float, str]:
     if not WEATHER_KEY or not city:
@@ -357,6 +357,51 @@ def weather_factor(city: Optional[str]) -> Tuple[float, str]:
         return factor, f"weather={pct}% ({'/'.join(notes) if notes else 'ok'})"
     except:
         return 1.0, "weather=0%"
+
+def weather_factor_debug(city: Optional[str]) -> Dict[str, Any]:
+    out = {"city": city or None, "enabled": bool(WEATHER_KEY), "ok": False}
+    if not WEATHER_KEY or not city:
+        out.update({"factor": 1.0, "reason": "weather=0%", "note": "no key or no city"})
+        return out
+    try:
+        r = requests.get(
+            "https://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "appid": WEATHER_KEY, "units": "metric"},
+            timeout=12
+        )
+        out["http"] = r.status_code
+        r.raise_for_status()
+        data = r.json()
+        temp = float(data["main"]["temp"])
+        wind = float(data["wind"]["speed"])
+        rain = 0.0
+        if isinstance(data.get("rain"), dict):
+            rain = float(data["rain"].get("1h", 0.0))
+
+        factor = 1.0
+        notes = []
+        if temp < 5 or temp > 28:
+            factor *= 0.95
+            notes.append("temp")
+        if rain > 0:
+            factor *= 0.95
+            notes.append("rain")
+        if wind > 8:
+            factor *= 0.96
+            notes.append("wind")
+        pct = int(round((factor - 1.0) * 100))
+        out.update({
+            "ok": True,
+            "temp": temp,
+            "wind": wind,
+            "rain_1h": rain,
+            "factor": factor,
+            "reason": f"weather={pct}% ({'/'.join(notes) if notes else 'ok'})"
+        })
+        return out
+    except Exception as e:
+        out.update({"factor": 1.0, "reason": "weather=0%", "error": str(e)})
+        return out
 
 # =====================================================
 # API-Football wrappers
@@ -419,37 +464,41 @@ def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[D
     return {"scored": scored / n, "conceded": conceded / n, "n": n, "opp_ids": opponents}
 
 # =====================================================
-# Factors: injuries / fatigue / motivation / SOS
+# Factors: injuries / fatigue / motivation / SOS + debug
 # =====================================================
-def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
-    out: Dict[int, Dict[str, int]] = {}
+def get_injuries_raw(fixture_id: int) -> List[Dict[str, Any]]:
     try:
         j = football_get("/injuries", {"fixture": fixture_id}, timeout=25)
-        resp = j.get("response", []) or []
-        for it in resp:
-            team = it.get("team", {}) or {}
-            tid = team.get("id")
-            if not tid:
-                continue
-            player = it.get("player", {}) or {}
-            ptype = str(player.get("type") or "").lower()
-
-            is_gk = "goalkeeper" in ptype or ptype in {"gk"}
-            is_def = "defender" in ptype or ptype in {"df", "def"}
-            is_mid = "midfielder" in ptype or ptype in {"mf", "mid"}
-            is_fwd = "attacker" in ptype or "forward" in ptype or ptype in {"fw", "fwd", "st", "striker"}
-
-            if int(tid) not in out:
-                out[int(tid)] = {"att": 0, "def": 0}
-
-            if is_gk or is_def:
-                out[int(tid)]["def"] += 1
-            elif is_mid or is_fwd:
-                out[int(tid)]["att"] += 1
-            else:
-                out[int(tid)]["att"] += 1
+        return j.get("response", []) or []
     except:
-        return out
+        return []
+
+def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
+    out: Dict[int, Dict[str, int]] = {}
+    resp = get_injuries_raw(fixture_id)
+
+    for it in resp:
+        team = it.get("team", {}) or {}
+        tid = team.get("id")
+        if not tid:
+            continue
+        player = it.get("player", {}) or {}
+        ptype = str(player.get("type") or "").lower()
+
+        is_gk = "goalkeeper" in ptype or ptype in {"gk"}
+        is_def = "defender" in ptype or ptype in {"df", "def"}
+        is_mid = "midfielder" in ptype or ptype in {"mf", "mid"}
+        is_fwd = "attacker" in ptype or "forward" in ptype or ptype in {"fw", "fwd", "st", "striker"}
+
+        if int(tid) not in out:
+            out[int(tid)] = {"att": 0, "def": 0}
+
+        if is_gk or is_def:
+            out[int(tid)]["def"] += 1
+        elif is_mid or is_fwd:
+            out[int(tid)]["att"] += 1
+        else:
+            out[int(tid)]["att"] += 1
     return out
 
 def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[int, Dict[str, int]], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
@@ -495,6 +544,38 @@ def get_fatigue_factor(team_id: int, match_ts_utc: int) -> Tuple[float, str, int
     except:
         return 1.00, "fatigue=0%", 0
 
+def get_fatigue_debug(team_id: int, match_ts_utc: int) -> Dict[str, Any]:
+    out = {"team_id": team_id, "ok": False}
+    try:
+        dt_match = datetime.utcfromtimestamp(int(match_ts_utc))
+        dt_from = (dt_match - timedelta(days=7)).date().isoformat()
+        dt_to = dt_match.date().isoformat()
+        j = football_get("/fixtures", {"team": team_id, "from": dt_from, "to": dt_to}, timeout=25)
+        resp = j.get("response", []) or []
+        played = 0
+        statuses: Dict[str, int] = {}
+        for it in resp:
+            fx = it.get("fixture", {}) or {}
+            st = (fx.get("status", {}) or {}).get("short", "") or "?"
+            statuses[st] = statuses.get(st, 0) + 1
+            if st in {"FT", "AET", "PEN"}:
+                played += 1
+        k, why, _played = get_fatigue_factor(team_id, match_ts_utc)
+        out.update({
+            "ok": True,
+            "from": dt_from,
+            "to": dt_to,
+            "resp_count": len(resp),
+            "played_finished": played,
+            "factor": k,
+            "why": why,
+            "statuses": statuses
+        })
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
 def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
     key = f"standings_{league_id}_{SEASON}"
     today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
@@ -529,6 +610,24 @@ def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
     save_state(STATE)
     return out
 
+def standings_debug(league_id: Optional[int]) -> Dict[str, Any]:
+    out = {"league_id": league_id, "ok": False}
+    if not league_id:
+        out["note"] = "no league_id"
+        return out
+    try:
+        smap = get_standings_map(int(league_id))
+        out["ok"] = True
+        out["teams"] = len(smap)
+        if smap:
+            pts = [int(v.get("points") or 0) for v in smap.values()]
+            out["points_min"] = min(pts) if pts else None
+            out["points_max"] = max(pts) if pts else None
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
+
 def strength_of_schedule_factor(league_id: Optional[int], opp_ids: List[int]) -> Tuple[float, str]:
     if not league_id or not opp_ids:
         return 1.0, "sos=0%"
@@ -558,6 +657,42 @@ def strength_of_schedule_factor(league_id: Optional[int], opp_ids: List[int]) ->
     k = 1.0 + 0.04 * diff
     pct = int(round((k - 1.0) * 100))
     return k, f"sos={pct:+d}%"
+
+def sos_debug(league_id: Optional[int], opp_ids: List[int]) -> Dict[str, Any]:
+    out = {"league_id": league_id, "ok": False, "opp_ids": len(opp_ids or [])}
+    if not league_id:
+        out["note"] = "no league_id"
+        return out
+    try:
+        smap = get_standings_map(int(league_id))
+        out["standings_teams"] = len(smap)
+        if not smap:
+            out["note"] = "standings empty"
+            return out
+
+        pts = []
+        for oid in (opp_ids or []):
+            row = smap.get(int(oid))
+            if row and row.get("points") is not None:
+                pts.append(int(row["points"]))
+        out["opp_pts_count"] = len(pts)
+        if len(pts) < 3:
+            out["note"] = "opp points < 3"
+            return out
+
+        league_pts = [int(v.get("points") or 0) for v in smap.values() if v.get("points") is not None]
+        if not league_pts:
+            out["note"] = "league points empty"
+            return out
+
+        avg_opp = sum(pts) / len(pts)
+        avg_lg = sum(league_pts) / len(league_pts)
+        k, why = strength_of_schedule_factor(league_id, opp_ids or [])
+        out.update({"ok": True, "avg_opp": avg_opp, "avg_league": avg_lg, "factor": k, "why": why})
+        return out
+    except Exception as e:
+        out["error"] = str(e)
+        return out
 
 def get_motivation_factor(league_name: str, league_id: Optional[int], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
     if is_cup_like(league_name):
@@ -1140,7 +1275,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /roi — ROI/проходимость\n"
         "• /history — последние 20 сигналов\n"
         "• /oddspapi_account — проверка OddsPapi\n"
-        "• /reload_leagues — пересканировать лиги\n\n"
+        "• /reload_leagues — пересканировать лиги\n"
+        "• /factors_debug [n] — debug факторов по n-му матчу дня\n\n"
         f"Bookmaker: {ODDSPAPI_BOOKMAKER}\n"
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
         f"Анти-анома Value: >{ANOMALY_VALUE_WARN:+.2f} → ⚠️\n"
@@ -1169,6 +1305,153 @@ async def reload_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "• (все найдены)\n"
 
     for part in chunked(text):
+        await update.message.reply_text(part)
+
+# ---------------------------
+# /factors_debug [n]
+# ---------------------------
+async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    fixtures, _, _, used_date = get_today_matches_filtered()
+    if not fixtures:
+        await update.message.reply_text(f"⚠️ На дату {used_date} матчей нет.")
+        return
+
+    idx = 1
+    if context.args:
+        try:
+            idx = max(1, int(context.args[0]))
+        except:
+            idx = 1
+    if idx > len(fixtures):
+        await update.message.reply_text(f"⚠️ В списке только {len(fixtures)} матчей. Ты запросил {idx}.")
+        return
+
+    f = fixtures[idx - 1]
+    fixture = f.get("fixture") or {}
+    teams = f.get("teams") or {}
+    home_t = teams.get("home") or {}
+    away_t = teams.get("away") or {}
+    league_obj = f.get("league") or {}
+
+    fixture_id = int(fixture.get("id") or 0)
+    ts = int(fixture.get("timestamp") or 0)
+    home_id = int(home_t.get("id") or 0)
+    away_id = int(away_t.get("id") or 0)
+
+    if not fixture_id or not ts or not home_id or not away_id:
+        await update.message.reply_text("❌ Не хватает данных по матчу (fixture_id/team_id/timestamp).")
+        return
+
+    league_name = league_obj.get("name", "?")
+    league_id = league_obj.get("id")
+    home_name = home_t.get("name", "?")
+    away_name = away_t.get("name", "?")
+    dt_msk = datetime.utcfromtimestamp(ts) + timedelta(hours=3)
+
+    venue = fixture.get("venue") or {}
+    city = venue.get("city")
+
+    # venue stats
+    hs = team_goal_stats_venue(home_id, "home", last=LAST_MATCHES_TEAM)
+    as_ = team_goal_stats_venue(away_id, "away", last=LAST_MATCHES_TEAM)
+
+    # injuries raw
+    inj_raw = get_injuries_raw(fixture_id)
+    inj_map = get_injuries_by_fixture(fixture_id)
+    h_inj = inj_map.get(home_id, {"att": 0, "def": 0})
+    a_inj = inj_map.get(away_id, {"att": 0, "def": 0})
+
+    # fatigue debug
+    fat_h = get_fatigue_debug(home_id, ts)
+    fat_a = get_fatigue_debug(away_id, ts)
+
+    # standings + sos debug
+    st_dbg = standings_debug(league_id)
+    sos_h_dbg = sos_debug(league_id, (hs or {}).get("opp_ids") or [])
+    sos_a_dbg = sos_debug(league_id, (as_ or {}).get("opp_ids") or [])
+
+    # weather debug
+    w_dbg = weather_factor_debug(city)
+
+    # final factors line
+    lam_home, lam_away, factors_line = compute_lambdas_and_factors(f)
+
+    lines = []
+    lines.append(f"🧪 FACTORS DEBUG ({used_date}) матч #{idx}/{len(fixtures)}")
+    lines.append(f"🏆 {league_name} (league_id={league_id})")
+    lines.append(f"{home_name} — {away_name}")
+    lines.append(f"🕒 {dt_msk.strftime('%Y-%m-%d %H:%M')} МСК | fixture_id={fixture_id}")
+    lines.append("")
+
+    # venue stats
+    if hs and as_:
+        lines.append("1) Venue stats (последние матчи по месту):")
+        lines.append(f"Home venue stats: n={int(hs['n'])} scored={hs['scored']:.2f} conceded={hs['conceded']:.2f} opp_ids={len(hs.get('opp_ids') or [])}")
+        lines.append(f"Away venue stats: n={int(as_['n'])} scored={as_['scored']:.2f} conceded={as_['conceded']:.2f} opp_ids={len(as_.get('opp_ids') or [])}")
+    else:
+        lines.append("1) Venue stats: ❌ не смог собрать (нет матчей/данных)")
+
+    lines.append("")
+    # injuries
+    lines.append("2) Injuries:")
+    lines.append(f"API /injuries response count: {len(inj_raw)}")
+    lines.append(f"Parsed injuries home(att/def): {h_inj.get('att',0)}/{h_inj.get('def',0)} | away(att/def): {a_inj.get('att',0)}/{a_inj.get('def',0)}")
+    if inj_raw:
+        lines.append("Sample (до 5 строк):")
+        for it in inj_raw[:5]:
+            tname = ((it.get("team") or {}).get("name") or "?")
+            pname = ((it.get("player") or {}).get("name") or "?")
+            ptype = ((it.get("player") or {}).get("type") or "?")
+            reason = ((it.get("player") or {}).get("reason") or "")
+            lines.append(f"- {tname}: {pname} | type={ptype} | {reason}")
+    else:
+        lines.append("NOTE: если тут 0 — значит API реально не отдаёт injuries по этому матчу (поэтому inj=0%).")
+
+    lines.append("")
+    # fatigue
+    lines.append("3) Fatigue (окно 7 дней):")
+    for tag, d in [("Home", fat_h), ("Away", fat_a)]:
+        if not d.get("ok"):
+            lines.append(f"{tag}: ❌ ошибка/нет данных: {d.get('error','?')}")
+            continue
+        lines.append(f"{tag}: from={d.get('from')} to={d.get('to')} resp={d.get('resp_count')} finished={d.get('played_finished')} factor={d.get('factor'):.3f} {d.get('why')}")
+        st = d.get("statuses") or {}
+        top = sorted(st.items(), key=lambda x: -x[1])[:6]
+        lines.append(f"{tag}: statuses sample: " + ", ".join([f"{k}:{v}" for k,v in top]))
+
+    lines.append("")
+    # standings/sos
+    lines.append("4) Standings / SOS:")
+    if st_dbg.get("ok"):
+        lines.append(f"Standings teams: {st_dbg.get('teams')} | points min/max: {st_dbg.get('points_min')}/{st_dbg.get('points_max')}")
+    else:
+        lines.append(f"Standings: ❌ {st_dbg.get('note') or st_dbg.get('error') or 'no data'}")
+
+    for tag, d in [("SOS home", sos_h_dbg), ("SOS away", sos_a_dbg)]:
+        if d.get("ok"):
+            lines.append(f"{tag}: opp_ids={d.get('opp_ids')} opp_pts={d.get('opp_pts_count')} avg_opp={d.get('avg_opp'):.2f} avg_lg={d.get('avg_league'):.2f} factor={d.get('factor'):.4f} {d.get('why')}")
+        else:
+            lines.append(f"{tag}: ❌ {d.get('note') or d.get('error') or 'no data'} (opp_ids={d.get('opp_ids')}, standings_teams={d.get('standings_teams')})")
+
+    lines.append("")
+    # weather
+    lines.append("5) Weather:")
+    lines.append(f"Venue city: {city}")
+    if w_dbg.get("ok"):
+        lines.append(f"temp={w_dbg.get('temp')}C wind={w_dbg.get('wind')}m/s rain1h={w_dbg.get('rain_1h')} | factor={w_dbg.get('factor'):.4f} | {w_dbg.get('reason')}")
+    else:
+        lines.append(f"weather debug: {w_dbg.get('reason')} | note={w_dbg.get('note') or w_dbg.get('error')}")
+
+    lines.append("")
+    # final
+    lines.append("6) Итоговая строка Factors и лямбды:")
+    lines.append(factors_line)
+    if lam_home is not None and lam_away is not None:
+        lines.append(f"Model λ: Home={lam_home:.2f} Away={lam_away:.2f} Total={lam_home+lam_away:.2f}")
+    else:
+        lines.append("Model λ: ❌ не посчиталось")
+
+    for part in chunked("\n".join(lines), 3500):
         await update.message.reply_text(part)
 
 # ---------------------------
@@ -1334,7 +1617,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lam_total = lam_home + lam_away
 
-        # Probabilities from Poisson
         p_o15 = prob_over_line_poisson(lam_total, 1.5)
         p_u15 = clamp(1.0 - p_o15, 0.05, 0.95)
 
@@ -1391,7 +1673,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("".join(out))
 
 # ---------------------------
-# /settle (FIXED)
+# /settle
 # ---------------------------
 async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = db_fetch_pending(limit=250)
@@ -1505,6 +1787,7 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("oddspapi_account", oddspapi_account))
     app.add_handler(CommandHandler("reload_leagues", reload_leagues))
+    app.add_handler(CommandHandler("factors_debug", factors_debug))
 
     app.run_polling()
 
