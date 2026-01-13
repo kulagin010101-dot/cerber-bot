@@ -40,6 +40,9 @@ LAST_MATCHES_TEAM = int(os.getenv("LAST_MATCHES_TEAM", "8"))
 FATIGUE_WINDOW_DAYS = int(os.getenv("FATIGUE_WINDOW_DAYS", "7"))
 FATIGUE_LAST_N = int(os.getenv("FATIGUE_LAST_N", "10"))
 
+# Injuries by TEAM cache TTL (seconds)
+INJ_TTL = int(os.getenv("INJ_TTL_SECONDS", str(6 * 3600)))  # 6h default
+
 # Anti-anomalies
 ANOMALY_VALUE_WARN = float(os.getenv("ANOMALY_VALUE_WARN", "0.50"))
 
@@ -468,44 +471,107 @@ def team_goal_stats_venue(team_id: int, venue: str, last: int = 8) -> Optional[D
     return {"scored": scored / n, "conceded": conceded / n, "n": n, "opp_ids": opponents}
 
 # =====================================================
-# Factors: injuries / fatigue(A) / motivation / SOS(B)
+# Injuries (UPDATED): by TEAM + league + season with cache
 # =====================================================
-def get_injuries_raw(fixture_id: int) -> List[Dict[str, Any]]:
+def _inj_cache_key(team_id: int, league_id: Optional[int]) -> str:
+    return f"inj_team_{team_id}_{league_id or 'any'}_{SEASON}"
+
+def _is_injury_active(item: Dict[str, Any]) -> bool:
+    # API может не иметь поля status — тогда считаем активным по умолчанию
+    status = str(item.get("player", {}).get("status") or item.get("status") or "").lower()
+    reason = str(item.get("player", {}).get("reason") or item.get("reason") or "").lower()
+    if not status and not reason:
+        return True
+    bad = ["suspended", "suspension", "red card", "yellow card"]
+    if any(b in status for b in bad) or any(b in reason for b in bad):
+        return False
+    # активные травмы/не играет
+    active_keys = ["inj", "out", "doubt", "question", "strain", "hamstring", "ankle", "knee", "muscle", "fract", "ill"]
+    return any(k in status for k in active_keys) or any(k in reason for k in active_keys) or ("out" in status)
+
+def get_team_injuries_raw(team_id: int, league_id: Optional[int]) -> List[Dict[str, Any]]:
+    key = _inj_cache_key(team_id, league_id)
+    cached = STATE.get(key)
+    cached_ts = float(STATE.get(key + "_ts", 0) or 0)
+    if isinstance(cached, list) and (time.time() - cached_ts) < INJ_TTL:
+        return cached
+
+    # основной запрос: team + league + season
+    params = {"team": team_id, "season": SEASON}
+    if league_id:
+        params["league"] = league_id
+
     try:
-        j = football_get("/injuries", {"fixture": fixture_id}, timeout=25)
-        return j.get("response", []) or []
-    except:
-        return []
+        j = football_get("/injuries", params, timeout=25)
+        resp = j.get("response", []) or []
+    except Exception as e:
+        print(f"[WARN] injuries team fetch failed (primary): {e}")
+        resp = []
 
-def get_injuries_by_fixture(fixture_id: int) -> Dict[int, Dict[str, int]]:
-    out: Dict[int, Dict[str, int]] = {}
-    resp = get_injuries_raw(fixture_id)
+    # fallback: если пусто и был league_id → попробуем без league (иногда API так отдаёт лучше)
+    if not resp and league_id:
+        try:
+            j = football_get("/injuries", {"team": team_id, "season": SEASON}, timeout=25)
+            resp = j.get("response", []) or []
+        except Exception as e:
+            print(f"[WARN] injuries team fetch failed (fallback): {e}")
+            resp = []
 
-    for it in resp:
-        team = it.get("team", {}) or {}
-        tid = team.get("id")
-        if not tid:
+    STATE[key] = resp
+    STATE[key + "_ts"] = time.time()
+    save_state(STATE)
+    return resp
+
+def count_team_injuries_att_def(team_id: int, league_id: Optional[int]) -> Tuple[Dict[str, int], int]:
+    """
+    Возвращает {"att": x, "def": y} и total_raw_count.
+    """
+    raw = get_team_injuries_raw(team_id, league_id)
+    att = 0
+    deff = 0
+
+    for it in raw:
+        if not _is_injury_active(it):
             continue
         player = it.get("player", {}) or {}
-        ptype = str(player.get("type") or "").lower()
+        ptype = str(player.get("type") or it.get("type") or "").lower()
 
         is_gk = "goalkeeper" in ptype or ptype in {"gk"}
         is_def = "defender" in ptype or ptype in {"df", "def"}
         is_mid = "midfielder" in ptype or ptype in {"mf", "mid"}
         is_fwd = "attacker" in ptype or "forward" in ptype or ptype in {"fw", "fwd", "st", "striker"}
 
-        if int(tid) not in out:
-            out[int(tid)] = {"att": 0, "def": 0}
-
         if is_gk or is_def:
-            out[int(tid)]["def"] += 1
+            deff += 1
         elif is_mid or is_fwd:
-            out[int(tid)]["att"] += 1
+            att += 1
         else:
-            out[int(tid)]["att"] += 1
-    return out
+            # неизвестный тип — считаем как атака
+            att += 1
 
-def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[int, Dict[str, int]], home_id: int, away_id: int) -> Tuple[float, float, str, str]:
+    return {"att": att, "def": deff}, len(raw)
+
+def get_injuries_map_for_match(home_id: int, away_id: int, league_id: Optional[int]) -> Tuple[Dict[int, Dict[str, int]], Dict[str, Any]]:
+    """
+    Собирает injuries map для apply_injury_adjustments, плюс debug.
+    """
+    h_counts, h_raw = count_team_injuries_att_def(home_id, league_id)
+    a_counts, a_raw = count_team_injuries_att_def(away_id, league_id)
+
+    inj_map: Dict[int, Dict[str, int]] = {
+        int(home_id): h_counts,
+        int(away_id): a_counts,
+    }
+    dbg = {
+        "home_raw": h_raw, "away_raw": a_raw,
+        "home_att": h_counts["att"], "home_def": h_counts["def"],
+        "away_att": a_counts["att"], "away_def": a_counts["def"],
+    }
+    return inj_map, dbg
+
+def apply_injury_adjustments(lam_home: float, lam_away: float,
+                            injuries: Dict[int, Dict[str, int]],
+                            home_id: int, away_id: int) -> Tuple[float, float, str, str]:
     h = injuries.get(int(home_id), {"att": 0, "def": 0})
     a = injuries.get(int(away_id), {"att": 0, "def": 0})
 
@@ -527,11 +593,10 @@ def apply_injury_adjustments(lam_home: float, lam_away: float, injuries: Dict[in
     why_a = f"injA(att-{2*a_att}%,oppDef+{2*h_def}%)"
     return lam_home2, lam_away2, why_h, why_a
 
-# -------- A) Fatigue stable: last=N + filter by timestamp ----------
+# =====================================================
+# Fatigue (A): last=N + filter by timestamp
+# =====================================================
 def get_fatigue_factor(team_id: int, match_ts_utc: int) -> Tuple[float, str, int]:
-    """
-    Берём last=N матчей и вручную считаем FT/AET/PEN в окне FATIGUE_WINDOW_DAYS до матча.
-    """
     try:
         dt_match = datetime.utcfromtimestamp(int(match_ts_utc))
         window_start = dt_match - timedelta(days=FATIGUE_WINDOW_DAYS)
@@ -602,6 +667,9 @@ def get_fatigue_debug(team_id: int, match_ts_utc: int) -> Dict[str, Any]:
         out["error"] = str(e)
         return out
 
+# =====================================================
+# Standings + SOS (B)
+# =====================================================
 def get_standings_map(league_id: int) -> Dict[int, Dict[str, Any]]:
     key = f"standings_{league_id}_{SEASON}"
     today = (datetime.utcnow() + timedelta(hours=3)).strftime("%Y-%m-%d")
@@ -654,7 +722,6 @@ def standings_debug(league_id: Optional[int]) -> Dict[str, Any]:
         out["error"] = str(e)
         return out
 
-# -------- B) SOS formatting shows small values ----------
 def sos_fmt(k: float) -> str:
     pct = (k - 1.0) * 100.0
     if abs(pct) < 0.05:
@@ -1231,7 +1298,7 @@ def profit_for_result(result: str, odds: float, stake: float) -> float:
 # =====================================================
 # Core factor computation per fixture (lambda model)
 # =====================================================
-def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str]:
+def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], str, Dict[str, Any]]:
     fixture = f.get("fixture") or {}
     teams = f.get("teams") or {}
     home_t = teams.get("home") or {}
@@ -1245,33 +1312,40 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
     league_name = league_obj.get("name", "?")
     league_id = league_obj.get("id")
 
+    dbg: Dict[str, Any] = {"inj": {}, "fat": {}, "sos": {}, "weather": {}}
+
     if not fixture_id or not home_id or not away_id or not ts:
-        return None, None, "Factors: (no ids)"
+        return None, None, "Factors: (no ids)", dbg
 
     home_stats = team_goal_stats_venue(int(home_id), venue="home", last=LAST_MATCHES_TEAM)
     away_stats = team_goal_stats_venue(int(away_id), venue="away", last=LAST_MATCHES_TEAM)
     if not home_stats or not away_stats:
-        return None, None, "Factors: (no venue stats)"
+        return None, None, "Factors: (no venue stats)", dbg
 
     lam_home = max(0.05, (home_stats["scored"] + away_stats["conceded"]) / 2.0)
     lam_away = max(0.05, (away_stats["scored"] + home_stats["conceded"]) / 2.0)
 
     sos_h_k, sos_h_why = strength_of_schedule_factor(league_id, home_stats.get("opp_ids") or [])
     sos_a_k, sos_a_why = strength_of_schedule_factor(league_id, away_stats.get("opp_ids") or [])
+    dbg["sos"] = {"home_k": sos_h_k, "away_k": sos_a_k, "home_why": sos_h_why, "away_why": sos_a_why}
     lam_home *= sos_h_k
     lam_away *= sos_a_k
 
     venue = fixture.get("venue") or {}
     city = venue.get("city")
     w_k, w_why = weather_factor(city)
+    dbg["weather"] = {"k": w_k, "why": w_why, "city": city}
     lam_home *= w_k
     lam_away *= w_k
 
-    injuries_map = get_injuries_by_fixture(int(fixture_id))
-    lam_home, lam_away, inj_h, inj_a = apply_injury_adjustments(lam_home, lam_away, injuries_map, int(home_id), int(away_id))
+    # UPDATED injuries by TEAM (+cache)
+    inj_map, inj_dbg = get_injuries_map_for_match(int(home_id), int(away_id), league_id)
+    dbg["inj"] = inj_dbg
+    lam_home, lam_away, inj_h, inj_a = apply_injury_adjustments(lam_home, lam_away, inj_map, int(home_id), int(away_id))
 
     fat_h_k, fat_h_why, fat_h_n = get_fatigue_factor(int(home_id), ts)
     fat_a_k, fat_a_why, fat_a_n = get_fatigue_factor(int(away_id), ts)
+    dbg["fat"] = {"home": (fat_h_k, fat_h_why, fat_h_n), "away": (fat_a_k, fat_a_why, fat_a_n)}
     lam_home *= fat_h_k
     lam_away *= fat_a_k
 
@@ -1287,7 +1361,7 @@ def compute_lambdas_and_factors(f: Dict[str, Any]) -> Tuple[Optional[float], Opt
         f"{fat_h_why}({fat_h_n}), {fat_a_why}({fat_a_n}); "
         f"{mot_h_why}, {mot_a_why}; {sos_h_why}, {sos_a_why}; {w_why}"
     )
-    return lam_home, lam_away, factors_line
+    return lam_home, lam_away, factors_line, dbg
 
 # =====================================================
 # Telegram commands
@@ -1309,6 +1383,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пороги: P≥{int(MIN_PROB*100)}% и Value>{MIN_VALUE:+.2f}\n"
         f"Анти-аномалия: Value>{ANOMALY_VALUE_WARN:+.2f} → ⚠️ проверь линию вручную\n"
         f"Fatigue окно: {FATIGUE_WINDOW_DAYS} дней (last={FATIGUE_LAST_N})\n"
+        f"Injuries: TEAM+league+season (cache {INJ_TTL//3600}h)\n"
         f"Stake: {STAKE:.2f} unit\n"
     )
 
@@ -1383,10 +1458,10 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     hs = team_goal_stats_venue(home_id, "home", last=LAST_MATCHES_TEAM)
     as_ = team_goal_stats_venue(away_id, "away", last=LAST_MATCHES_TEAM)
 
-    inj_raw = get_injuries_raw(fixture_id)
-    inj_map = get_injuries_by_fixture(fixture_id)
-    h_inj = inj_map.get(home_id, {"att": 0, "def": 0})
-    a_inj = inj_map.get(away_id, {"att": 0, "def": 0})
+    # NEW injuries by TEAM (with raw counts)
+    inj_map, inj_dbg = get_injuries_map_for_match(home_id, away_id, league_id)
+    h_counts = inj_map.get(home_id, {"att": 0, "def": 0})
+    a_counts = inj_map.get(away_id, {"att": 0, "def": 0})
 
     fat_h = get_fatigue_debug(home_id, ts)
     fat_a = get_fatigue_debug(away_id, ts)
@@ -1397,7 +1472,7 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     w_dbg = weather_factor_debug(city)
 
-    lam_home, lam_away, factors_line = compute_lambdas_and_factors(f)
+    lam_home, lam_away, factors_line, dbg = compute_lambdas_and_factors(f)
 
     lines = []
     lines.append(f"🧪 FACTORS DEBUG ({used_date}) матч #{idx}/{len(fixtures)}")
@@ -1414,11 +1489,11 @@ async def factors_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("1) Venue stats: ❌ (no data)")
 
     lines.append("")
-    lines.append("2) Injuries:")
-    lines.append(f"API /injuries response count: {len(inj_raw)}")
-    lines.append(f"Parsed injuries home(att/def): {h_inj.get('att',0)}/{h_inj.get('def',0)} | away(att/def): {a_inj.get('att',0)}/{a_inj.get('def',0)}")
-    if not inj_raw:
-        lines.append("NOTE: injuries=0 → API реально не отдаёт травмы по этому fixture.")
+    lines.append("2) Injuries (TEAM+league+season):")
+    lines.append(f"API team injuries raw count: home={inj_dbg.get('home_raw',0)} away={inj_dbg.get('away_raw',0)}")
+    lines.append(f"Parsed injuries home(att/def): {h_counts.get('att',0)}/{h_counts.get('def',0)} | away(att/def): {a_counts.get('att',0)}/{a_counts.get('def',0)}")
+    if (inj_dbg.get("home_raw", 0) == 0) and (inj_dbg.get("away_raw", 0) == 0):
+        lines.append("NOTE: если тут 0 — API реально не отдаёт injuries по team/league/season (или тариф/источник пустой).")
 
     lines.append("")
     lines.append("3) Fatigue (A):")
@@ -1553,7 +1628,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return None
 
         ok_odds, odds_warn = odds_sanity(market_code, float(book))
-
         if p < MIN_PROB:
             return None
 
@@ -1621,7 +1695,7 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not any(v is not None for v in odds.values()):
             continue
 
-        lam_home, lam_away, factors_line = compute_lambdas_and_factors(f)
+        lam_home, lam_away, factors_line, _dbg = compute_lambdas_and_factors(f)
         if lam_home is None or lam_away is None:
             continue
 
